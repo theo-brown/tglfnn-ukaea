@@ -1,0 +1,27 @@
+[build-system]
+requires = [
+  "setuptools>=64",
+  "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tglfnn_ukaea"
+version = "0.1.0"
+description = "Neural network surrogate of TGLF (weights only)"
+readme = "README.md"
+requires-python = ">=3"
+license = "LGPL-3.0"
+license-files = ["LICENSE"]
+authors = [{name = "UKAEA"}]
+
+dependencies = ["numpy>2"]
+
+[project.urls]
+Homepage = "https://github.com/ukaea/tglfnn-ukaea/"
+Repository = "https://github.com/ukaea/tglfnn-ukaea/"
+
+[tool.setuptools]
+packages = ["tglfnn_ukaea"]
+
+[tool.setuptools.package-data]
+tglfnn_ukaea = ["weights/multimachine.pkl"]
