@@ -1,6 +1,14 @@
 # tglfnn-ukaea
 Neural network surrogate models of the [TGLF](https://gafusion.github.io/doc/tglf.html) quasilinear plasma turbulent transport simulator in various parameter spaces.
 
+## Paper for acknowledgment
+
+If you use these models within your work, we request you cite the following paper:
+
+* L. Zanisi et al., [Data efficent digital twinning strategies and surrogate models of quasilinear turbulence in JET and STEP](https://conferences.iaea.org/event/392/contributions/36059/), International Atomic Energy Agency - Fusion Energy Conference, Chengdu, China, 2025
+
+# Usage
+
 Various different methods exist for using the models:
 
 1. Loading from PyTorch checkpoint
@@ -53,6 +61,8 @@ output_tensor = torchscript_model(input_tensor)
 ### Using the traced TorchScript models in Fortran
 
 The traced PyTorch models can be used in Fortran with [FTorch](https://github.com/Cambridge-ICCS/FTorch), which provides Fortran bindings for LibTorch (the C++ backend of PyTorch).  Please [cite the Ftorch publication](https://github.com/Cambridge-ICCS/FTorch#authors-and-acknowledgment) if using these models from Fortran.
+
+Further details on the FTorch Implementation of these networks can be found in a [related project](https://github.com/ProjectTorreyPines/TurbulentTransport.jl/blob/master/utilities/README_onnx_to_pytorch_fortran.md).
 
 #### Prerequisites
 
