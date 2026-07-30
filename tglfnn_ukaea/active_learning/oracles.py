@@ -11,6 +11,8 @@ surrogate: SAT2, electrostatic, 2 species (electrons + deuterium),
 Miller geometry with R/a = 3.
 """
 
+import multiprocessing
+import os
 from typing import Callable, Mapping, Sequence
 
 import numpy as np
@@ -122,8 +124,29 @@ def _gacode_params(named_inputs: Mapping[str, float]) -> dict:
     return params
 
 
+def _run_tglf_point(
+    point: Sequence[float], input_labels: Sequence[str]
+) -> tuple:
+    """Runs TGLF on one point; returns an (efe, efi, pfi) tuple (NaN on failure)."""
+    from torax._src.transport_model.tglf import tglf2py
+
+    named_inputs = dict(zip(input_labels, point))
+    try:
+        _, ion_pflux, elec_eflux, ion_eflux = tglf2py.run_tglf(
+            **_gacode_params(named_inputs)
+        )
+    except Exception as error:  # TGLF crashes on some corner points.
+        print(f"TGLF failed on point {dict(named_inputs)}: {error}")
+        return (float("nan"),) * len(OUTPUT_LABELS)
+    return (
+        float(np.sum(elec_eflux)),
+        float(np.sum(ion_eflux)),
+        float(np.sum(ion_pflux)),
+    )
+
+
 def tglf_oracle(x: np.ndarray, input_labels: Sequence[str]) -> np.ndarray:
-    """Runs TGLF (via the TORAX wrapper) on each row of ``x``.
+    """Runs TGLF (via the TORAX wrapper) serially on each row of ``x``.
 
     Args:
         x: Input points, shape ``(n_points, n_inputs)``, in physical units,
@@ -135,25 +158,60 @@ def tglf_oracle(x: np.ndarray, input_labels: Sequence[str]) -> np.ndarray:
         Fluxes in gyro-Bohm units, shape ``(n_points, 3)``, with columns
         ``(efe_gb, efi_gb, pfi_gb)``. Rows where TGLF fails are NaN.
     """
-    from torax._src.transport_model.tglf import tglf2py
-
     x = np.atleast_2d(np.asarray(x, dtype=np.float64))
-    fluxes = np.full((x.shape[0], len(OUTPUT_LABELS)), np.nan)
-    for i, point in enumerate(x):
-        named_inputs = dict(zip(input_labels, point))
-        try:
-            _, ion_pflux, elec_eflux, ion_eflux = tglf2py.run_tglf(
-                **_gacode_params(named_inputs)
+    return np.array(
+        [_run_tglf_point(tuple(point), tuple(input_labels)) for point in x]
+    )
+
+
+def _init_tglf_worker() -> None:
+    """Initialises one TGLF worker process."""
+    # TGLF points are distributed one per process; don't let each worker's
+    # OpenMP runtime also fan out over all cores.
+    os.environ["OMP_NUM_THREADS"] = "1"
+    # Import once so the per-point calls don't pay the TORAX import cost.
+    from torax._src.transport_model.tglf import tglf2py  # noqa: F401
+
+
+class ParallelTGLFOracle:
+    """Runs TGLF points in parallel across worker processes.
+
+    TGLF's state lives in Fortran module memory, so each worker process
+    hosts its own independent TGLF instance. Workers are spawned once (each
+    paying the TORAX import cost at startup) and reused across calls, and
+    points are handed out one at a time since TGLF runtimes vary per point.
+
+    Use as a drop-in replacement for :func:`tglf_oracle`::
+
+        oracle = ParallelTGLFOracle(n_workers=8)
+        run_active_learning(config, oracle=oracle)
+    """
+
+    def __init__(self, n_workers: int | None = None):
+        self.n_workers = n_workers or os.cpu_count() or 1
+        self._pool = None
+
+    def __call__(self, x: np.ndarray, input_labels: Sequence[str]) -> np.ndarray:
+        x = np.atleast_2d(np.asarray(x, dtype=np.float64))
+        if self._pool is None:
+            # Spawn (rather than fork) to keep the workers free of the
+            # parent's JAX/OpenMP thread state.
+            context = multiprocessing.get_context("spawn")
+            self._pool = context.Pool(
+                self.n_workers, initializer=_init_tglf_worker
             )
-        except Exception as error:  # TGLF crashes on some corner points.
-            print(f"TGLF failed on point {i}: {error}")
-            continue
-        fluxes[i] = [
-            np.sum(elec_eflux),
-            np.sum(ion_eflux),
-            np.sum(ion_pflux),
-        ]
-    return fluxes
+        results = self._pool.starmap(
+            _run_tglf_point,
+            [(tuple(point), tuple(input_labels)) for point in x],
+            chunksize=1,
+        )
+        return np.array(results)
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.close()
+            self._pool.join()
+            self._pool = None
 
 
 def mock_oracle(x: np.ndarray, input_labels: Sequence[str]) -> np.ndarray:

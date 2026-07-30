@@ -92,6 +92,9 @@ pip install -e .[active-learning]
 # https://torax.readthedocs.io/en/latest/installation.html#optional-install-tglf
 python scripts/run_active_learning.py --n-rounds 10 --acquisition-batch 64
 
+# Parallelise TGLF over all CPU cores (one TGLF instance per worker process):
+python scripts/run_active_learning.py --oracle-workers 0
+
 # Dry run without TGLF installed:
 python scripts/run_active_learning.py --mock-oracle
 ```

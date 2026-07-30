@@ -36,13 +36,21 @@ def main() -> None:
         action="store_true",
         help="Use a cheap analytic oracle instead of TGLF (for testing).",
     )
+    parser.add_argument(
+        "--oracle-workers",
+        type=int,
+        default=1,
+        help="TGLF worker processes: 1 runs serially, 0 uses all CPU cores.",
+    )
     args = vars(parser.parse_args())
 
-    oracle = (
-        active_learning.mock_oracle
-        if args.pop("mock_oracle")
-        else active_learning.tglf_oracle
-    )
+    n_workers = args.pop("oracle_workers")
+    if args.pop("mock_oracle"):
+        oracle = active_learning.mock_oracle
+    elif n_workers == 1:
+        oracle = active_learning.tglf_oracle
+    else:
+        oracle = active_learning.ParallelTGLFOracle(n_workers or None)
     config = active_learning.ActiveLearningConfig(**args)
     result = active_learning.run_active_learning(config, oracle=oracle)
     print(f"Done: {len(result['x'])} labelled points, "
