@@ -165,6 +165,8 @@ def train_ensemble(
     batch_size: int,
     learning_rate: float,
     dropout_rate: float = 0.0,
+    replay: Tuple[jax.Array, jax.Array] | None = None,
+    replay_weight: float = 1.0,
 ) -> Tuple[Params, float]:
     """Trains all ensemble members of one flux with Adam on the Gaussian NLL.
 
@@ -180,6 +182,12 @@ def train_ensemble(
         batch_size: Minibatch size per member.
         learning_rate: Adam learning rate.
         dropout_rate: Hidden-layer dropout rate during training.
+        replay: Optional distillation-replay data ``(x_replay, y_replay)``
+            with shapes ``(n_replay, n_inputs)`` and *per-member* targets
+            ``(n_members, n_replay)`` (normalised units) — typically each
+            member's own frozen pretrained prediction. Anchors the model
+            outside the acquired data without collapsing member diversity.
+        replay_weight: Weight of the replay NLL relative to the data NLL.
 
     Returns:
         ``(trained_params, final_mean_loss)``.
@@ -190,19 +198,47 @@ def train_ensemble(
     optimizer = optax.adam(learning_rate)
     opt_state = jax.vmap(optimizer.init)(stacked_params)
 
+    if replay is not None:
+        x_replay, y_replay = replay
+        n_replay = x_replay.shape[0]
+        replay_batch_size = min(batch_size, n_replay)
+    else:
+        # Dummy per-member targets so member_step keeps a fixed signature.
+        y_replay = jnp.zeros((n_members, 1))
+
     @jax.jit
     def step(params, opt_state, key):
-        def member_step(params, opt_state, key):
-            batch_key, dropout_key = jax.random.split(key)
-            idx = jax.random.randint(batch_key, (batch_size,), 0, n_samples)
-            loss, grads = jax.value_and_grad(gaussian_nll)(
-                params, x[idx], y[idx], dropout_key, dropout_rate
+        def member_step(params, opt_state, key, y_replay_member):
+            batch_key, dropout_key, replay_key, replay_dropout_key = (
+                jax.random.split(key, 4)
             )
+
+            def loss_fn(params):
+                idx = jax.random.randint(
+                    batch_key, (batch_size,), 0, n_samples
+                )
+                loss = gaussian_nll(
+                    params, x[idx], y[idx], dropout_key, dropout_rate
+                )
+                if replay is not None:
+                    replay_idx = jax.random.randint(
+                        replay_key, (replay_batch_size,), 0, n_replay
+                    )
+                    loss += replay_weight * gaussian_nll(
+                        params,
+                        x_replay[replay_idx],
+                        y_replay_member[replay_idx],
+                        replay_dropout_key,
+                        dropout_rate,
+                    )
+                return loss
+
+            loss, grads = jax.value_and_grad(loss_fn)(params)
             updates, opt_state = optimizer.update(grads, opt_state, params)
             return optax.apply_updates(params, updates), opt_state, loss
 
         keys = jax.random.split(key, n_members)
-        return jax.vmap(member_step)(params, opt_state, keys)
+        return jax.vmap(member_step)(params, opt_state, keys, y_replay)
 
     n_steps = epochs * max(1, n_samples // batch_size)
     losses = jnp.zeros(n_members)

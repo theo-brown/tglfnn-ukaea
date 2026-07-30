@@ -43,6 +43,17 @@ class ActiveLearningConfig:
     batch_size: int = 256
     learning_rate: float = 1e-4
     dropout: float = 0.05
+    # Candidates only qualify for acquisition if |predicted flux| plus this
+    # many predicted standard deviations stays below the flux cuts, so TGLF
+    # runs are not spent right at the cut boundary.
+    acquisition_margin_sigma: float = 1.0
+    # Distillation replay: per round, this many free random points are
+    # pseudo-labelled by the *frozen pretrained* ensemble (member-wise) and
+    # trained on alongside the TGLF data, anchoring the model against
+    # forgetting outside the acquired regions. 0 disables; requires
+    # warm_start.
+    n_replay: int = 1024
+    replay_weight: float = 1.0
     validation_fraction: float = 0.2
     seed: int = 0
     warm_start: bool = True  # Start from the shipped pretrained weights.
@@ -77,21 +88,33 @@ def acquisition_scores(
     x_norm: jax.Array,
     normalizer: model_lib.Normalizer,
     flux_cutoff_gb: Mapping[str, float],
+    margin_sigma: float = 0.0,
 ) -> jax.Array:
     """Ensemble disagreement, summed over fluxes (in normalised units).
 
-    Candidates whose *predicted* fluxes already exceed the training-data cuts
-    score ``-inf``: their TGLF labels would be discarded by
-    :func:`filter_valid` anyway, so labelling them wastes TGLF runs. (Without
-    this mask the loop stalls, because disagreement is largest precisely in
-    the super-critical corners of the hypercube.)"""
+    Candidates whose *predicted* fluxes exceed the training-data cuts, within
+    ``margin_sigma`` predicted standard deviations, score ``-inf``: their
+    TGLF labels would be discarded by :func:`filter_valid` anyway, so
+    labelling them wastes TGLF runs. (Without this mask the loop stalls,
+    because disagreement is largest precisely in the super-critical corners
+    of the hypercube; without the margin it stalls more slowly, on the
+    boundary points whose labels land just above the cuts.)"""
     total = jnp.zeros(x_norm.shape[0])
     within_cuts = jnp.ones(x_norm.shape[0], dtype=bool)
     for label, stacked_params in params_by_flux.items():
-        mean_norm, _, epistemic_var = model_lib.predict(stacked_params, x_norm)
+        mean_norm, aleatoric_var, epistemic_var = model_lib.predict(
+            stacked_params, x_norm
+        )
         total += jnp.sqrt(epistemic_var)
         predicted = normalizer.unnormalize_output(mean_norm, label)
-        within_cuts &= jnp.abs(predicted) <= flux_cutoff_gb[label]
+        predicted_std = (
+            jnp.sqrt(aleatoric_var + epistemic_var)
+            * normalizer.output_std[label]
+        )
+        within_cuts &= (
+            jnp.abs(predicted) + margin_sigma * predicted_std
+            <= flux_cutoff_gb[label]
+        )
     return jnp.where(within_cuts, total, -jnp.inf)
 
 
@@ -187,6 +210,13 @@ def run_active_learning(
             label: model_lib.stack_ensemble(model_dict["params"][label])
             for label in output_labels
         }
+        # Frozen copy of the pretrained ensembles, used as the distillation
+        # replay teacher (stack_ensemble builds fresh arrays, and training
+        # never mutates in place, so no explicit copy is needed).
+        pretrained_by_flux = {
+            label: model_lib.stack_ensemble(model_dict["params"][label])
+            for label in output_labels
+        }
     else:
         n_members = model_dict["config"].get("num_estimators", 5)
         params_by_flux = {}
@@ -221,6 +251,7 @@ def run_active_learning(
                 normalizer.normalize_inputs(candidates),
                 normalizer,
                 config.flux_cutoff_gb,
+                config.acquisition_margin_sigma,
             )
             batch_indices = jnp.argsort(scores)[-config.acquisition_batch :]
         elif config.acquisition == "random":
@@ -251,11 +282,29 @@ def run_active_learning(
         val_idx, train_idx = permutation[:n_val], permutation[n_val:]
         x_train = jnp.asarray(x_data)[train_idx]
         x_train_norm = normalizer.normalize_inputs(x_train)
+        use_replay = config.n_replay > 0 and config.warm_start
+        if use_replay:
+            key, replay_key = jax.random.split(key)
+            x_replay_norm = normalizer.normalize_inputs(
+                sample_inputs(
+                    replay_key, config.n_replay, input_labels, param_space
+                )
+            )
         train_losses = {}
         for i, label in enumerate(output_labels):
             y_train_norm = normalizer.normalize_output(
                 jnp.asarray(y_data)[train_idx, i], label
             )
+            replay = None
+            if use_replay:
+                # Member-wise pseudo-labels from the frozen pretrained
+                # ensemble: member m is distilled towards pretrained member
+                # m, preserving the ensemble spread (and hence the
+                # acquisition signal) away from the acquired data.
+                replay_targets = jax.vmap(
+                    lambda p: model_lib.mlp_apply(p, x_replay_norm)[0]
+                )(pretrained_by_flux[label])
+                replay = (x_replay_norm, replay_targets)
             key, train_key = jax.random.split(key)
             params_by_flux[label], train_losses[label] = model_lib.train_ensemble(
                 params_by_flux[label],
@@ -266,6 +315,8 @@ def run_active_learning(
                 batch_size=config.batch_size,
                 learning_rate=config.learning_rate,
                 dropout_rate=config.dropout,
+                replay=replay,
+                replay_weight=config.replay_weight,
             )
 
         # 5. Report and checkpoint.
