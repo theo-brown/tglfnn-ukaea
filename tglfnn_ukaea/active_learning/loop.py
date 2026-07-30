@@ -15,6 +15,7 @@ Each round:
 import dataclasses
 import pathlib
 import pickle
+import time
 from typing import Mapping, Sequence, Tuple
 
 import jax
@@ -208,6 +209,7 @@ def run_active_learning(
 
     history = []
     for round_index in range(config.n_rounds):
+        round_start = time.monotonic()
         # 1-2. Sample candidates and pick the batch to label.
         key, candidate_key, acquisition_key = jax.random.split(key, 3)
         candidates = sample_inputs(
@@ -233,7 +235,9 @@ def run_active_learning(
         x_new = np.asarray(candidates[batch_indices])
 
         # 3. Label with TGLF.
+        oracle_start = time.monotonic()
         y_new = oracle(x_new, input_labels)
+        oracle_seconds = time.monotonic() - oracle_start
         x_new, y_new = filter_valid(
             x_new, y_new, output_labels, config.flux_cutoff_gb
         )
@@ -269,6 +273,8 @@ def run_active_learning(
             "round": round_index,
             "n_data": len(x_data),
             "n_new": len(x_new),
+            "seconds_oracle": oracle_seconds,
+            "seconds_round": time.monotonic() - round_start,
             **{f"train_nll_{k}": v for k, v in train_losses.items()},
         }
         if n_val > 0:
