@@ -69,16 +69,26 @@ class SharedTrunkMeanStudent(nn.Module):
     hidden_size: int
     activation: str
     n_heads: int
+    dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, x):
         act = _ACTIVATIONS[self.activation]
+        x = x.astype(self.dtype)
         for j in range(self.num_hiddens - 1):
-            x = act(nn.Dense(self.hidden_size, name=f"Trunk_{j}")(x))
+            x = act(
+                nn.Dense(
+                    self.hidden_size, name=f"Trunk_{j}", dtype=self.dtype
+                )(x)
+            )
         heads = [
-            nn.Dense(1, name=f"Head_{i}")(x) for i in range(self.n_heads)
+            nn.Dense(1, name=f"Head_{i}", dtype=self.dtype)(x)
+            for i in range(self.n_heads)
         ]
-        return jnp.concatenate(heads, axis=-1)  # (batch, n_heads)
+        # Params stay float32 (Flax default param_dtype); only the compute
+        # runs in self.dtype. Return float32 so the loss is accumulated at
+        # full precision.
+        return jnp.concatenate(heads, axis=-1).astype(jnp.float32)
 
 
 def build_teacher(model_dict: Mapping[str, Any]):
@@ -226,6 +236,24 @@ def main():
                         "makes plateaus diagnostic of convergence rather "
                         "than of the annealing.")
     parser.add_argument("--warmup-steps", type=int, default=500)
+    parser.add_argument("--decay-fraction", type=float, default=0.2,
+                        help="Fraction of --steps spent in the final cosine "
+                        "decay phase of the 'wsd' schedule.")
+    parser.add_argument("--dtype", default="float32",
+                        choices=["float32", "bfloat16"],
+                        help="Compute dtype for the student's forward/"
+                        "backward pass (shared-trunk mode only). Parameters "
+                        "and the loss stay float32; the exported checkpoint "
+                        "is float32 either way.")
+    parser.add_argument("--resample-every", type=int, default=0,
+                        help="If > 0, regenerate and relabel the entire "
+                        "training pool every this many steps (online "
+                        "resampling). The distillation targets are "
+                        "noiseless and teacher labelling is cheap, so this "
+                        "removes the finite-pool memorisation floor: the "
+                        "student never sees the same sample twice across "
+                        "pool generations. The validation set is fixed. "
+                        "0 keeps a single fixed pool.")
     parser.add_argument("--weight-decay", type=float, default=1e-5,
                         help="AdamW weight decay. Distillation targets are "
                         "noiseless, so 0 is a reasonable choice.")
@@ -311,14 +339,22 @@ def main():
     rng = np.random.default_rng(args.seed)
     t0 = time.time()
     n_oob = int(args.n_train * args.oob_fraction)
-    x_train = np.concatenate([
-        sample_inputs(teacher_dict, args.n_train - n_oob, rng),
-        sample_inputs(teacher_dict, n_oob, rng, margin=args.oob_margin),
-    ])
+
+    def make_pool(pool_rng):
+        """Samples and teacher-labels a fresh training pool."""
+        x = np.concatenate([
+            sample_inputs(teacher_dict, args.n_train - n_oob, pool_rng),
+            sample_inputs(
+                teacher_dict, n_oob, pool_rng, margin=args.oob_margin
+            ),
+        ])
+        z = (jnp.asarray(x) - in_means) / in_stds
+        y = teacher_labels(teacher_network, teacher_params, z)
+        return z, jnp.asarray(y)
+
+    z_train_dev, y_train_dev = make_pool(rng)
     x_val = sample_inputs(teacher_dict, args.n_val, rng)
-    z_train = (jnp.asarray(x_train) - in_means) / in_stds
     z_val = (jnp.asarray(x_val) - in_means) / in_stds
-    y_train = teacher_labels(teacher_network, teacher_params, z_train)
     y_val = teacher_labels(teacher_network, teacher_params, z_val)
     print(f"Labelled {args.n_train}+{args.n_val} samples with the teacher in "
           f"{time.time() - t0:.1f}s")
@@ -326,12 +362,15 @@ def main():
     # --- Student setup ----------------------------------------------------
     init_seed = args.init_seed if args.init_seed is not None else args.seed
     dummy = jnp.zeros((1, n_inputs))
+    if args.dtype != "float32" and not args.shared_trunk:
+        raise SystemExit("--dtype bfloat16 requires --shared-trunk")
     if args.shared_trunk:
         student_network = SharedTrunkMeanStudent(
             num_hiddens=args.num_hiddens,
             hidden_size=args.hidden_size,
             activation=args.activation,
             n_heads=n_fluxes,
+            dtype=jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32,
         )
         student_params = student_network.init(
             jax.random.key(init_seed), dummy
@@ -354,7 +393,7 @@ def main():
         )
 
     if args.schedule == "wsd":
-        decay_steps = max(1, int(0.2 * args.steps))
+        decay_steps = max(1, int(args.decay_fraction * args.steps))
         stable_steps = max(0, args.steps - args.warmup_steps - decay_steps)
         schedule = optax.join_schedules(
             [
@@ -371,8 +410,6 @@ def main():
         schedule = optax.cosine_decay_schedule(args.lr, args.steps)
     optimizer = optax.adamw(schedule, weight_decay=args.weight_decay)
 
-    z_train_dev = jnp.asarray(z_train)
-    y_train_dev = jnp.asarray(y_train)
     var_weight = args.var_loss_weight
     eps = 1e-6
 
@@ -382,9 +419,6 @@ def main():
     out_means_dev = jnp.array(
         [teacher_dict["stats"][label]["mean"] for label in output_labels]
     )
-    flux_gb = jnp.abs(
-        y_train_dev[..., 0] * out_stds_dev[:, None] + out_means_dev[:, None]
-    )  # (n_fluxes, n_samples)
 
     # Teacher's mean total variance per flux: the variance-head bias init for
     # the Gaussian student, or the constant exported variance for the
@@ -401,33 +435,42 @@ def main():
 
     opt_state = optimizer.init(student_params)
 
-    # Per-sample-per-flux loss weights (asinh-equivalent error allocation).
-    if args.loss_weight_q0 > 0:
-        q0 = args.loss_weight_q0
-        relative = q0**2 / (q0**2 + flux_gb**2)
-        loss_weights = (
-            args.loss_weight_floor
-            + (1.0 - args.loss_weight_floor) * relative
-        )
-    else:
-        loss_weights = jnp.ones_like(flux_gb)
-    loss_weights = loss_weights / jnp.mean(loss_weights)
+    def pool_arrays(y_pool):
+        """Per-pool loss weights and minibatch-sampling CDF.
 
-    # Threshold-weighted minibatch sampling: probability proportional to a
-    # mixture of uniform and the per-flux average of 1/(|flux_GB| + q0),
-    # implemented as inverse-CDF sampling inside the jitted train step.
-    near_threshold_weight = jnp.mean(
-        1.0 / (flux_gb + args.threshold_q0), axis=0
-    )
-    n_pool = z_train_dev.shape[0]
-    probabilities = (
-        args.uniform_fraction / n_pool
-        + (1.0 - args.uniform_fraction)
-        * near_threshold_weight
-        / jnp.sum(near_threshold_weight)
-    )
-    sampling_cdf = jnp.cumsum(probabilities)
-    sampling_cdf = sampling_cdf / sampling_cdf[-1]
+        Loss weights implement the asinh-equivalent error allocation; the CDF
+        implements threshold-weighted minibatch sampling (probability
+        proportional to a mixture of uniform and the per-flux average of
+        1/(|flux_GB| + q0)) via inverse-CDF lookup in the jitted train step.
+        """
+        flux_gb = jnp.abs(
+            y_pool[..., 0] * out_stds_dev[:, None] + out_means_dev[:, None]
+        )  # (n_fluxes, n_samples)
+        if args.loss_weight_q0 > 0:
+            q0 = args.loss_weight_q0
+            relative = q0**2 / (q0**2 + flux_gb**2)
+            weights = (
+                args.loss_weight_floor
+                + (1.0 - args.loss_weight_floor) * relative
+            )
+        else:
+            weights = jnp.ones_like(flux_gb)
+        weights = weights / jnp.mean(weights)
+
+        near_threshold_weight = jnp.mean(
+            1.0 / (flux_gb + args.threshold_q0), axis=0
+        )
+        n_pool = y_pool.shape[1]
+        probabilities = (
+            args.uniform_fraction / n_pool
+            + (1.0 - args.uniform_fraction)
+            * near_threshold_weight
+            / jnp.sum(near_threshold_weight)
+        )
+        cdf = jnp.cumsum(probabilities)
+        return weights, cdf / cdf[-1]
+
+    loss_weights, sampling_cdf = pool_arrays(y_train_dev)
 
     sign_scale = args.loss_weight_q0 if args.loss_weight_q0 > 0 else 10.0
 
@@ -471,11 +514,11 @@ def main():
             return total, (mean_loss, logvar_loss, sign_loss)
 
     @jax.jit
-    def train_step(params, opt_state, key):
+    def train_step(params, opt_state, key, z_pool, y_pool, w_pool, cdf):
         uniforms = jax.random.uniform(key, (args.batch_size,))
-        idx = jnp.searchsorted(sampling_cdf, uniforms)
+        idx = jnp.searchsorted(cdf, uniforms)
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            params, z_train_dev[idx], y_train_dev[:, idx], loss_weights[:, idx]
+            params, z_pool[idx], y_pool[:, idx], w_pool[:, idx]
         )
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
@@ -485,9 +528,26 @@ def main():
     t0 = time.time()
     key = jax.random.key(init_seed + 1)
     for step in range(args.steps):
+        if (
+            args.resample_every > 0
+            and step > 0
+            and step % args.resample_every == 0
+        ):
+            # Online resampling: a completely fresh, freshly-labelled pool.
+            # Pool shapes are unchanged, so the jitted step does not
+            # recompile.
+            tr = time.time()
+            generation = step // args.resample_every
+            z_train_dev, y_train_dev = make_pool(
+                np.random.default_rng(args.seed + 100_003 * generation)
+            )
+            loss_weights, sampling_cdf = pool_arrays(y_train_dev)
+            print(f"step {step:5d} resampled pool (generation {generation}, "
+                  f"{time.time() - tr:.1f}s)")
         key, subkey = jax.random.split(key)
         student_params, opt_state, loss, aux = train_step(
-            student_params, opt_state, subkey
+            student_params, opt_state, subkey,
+            z_train_dev, y_train_dev, loss_weights, sampling_cdf,
         )
         if step % 200 == 0 or step == args.steps - 1:
             print(f"step {step:5d} loss={float(loss):.5f} "
@@ -631,6 +691,9 @@ def main():
             "lr": args.lr,
             "schedule": args.schedule,
             "warmup_steps": args.warmup_steps,
+            "decay_fraction": args.decay_fraction,
+            "dtype": args.dtype,
+            "resample_every": args.resample_every,
             "weight_decay": args.weight_decay,
             "var_loss_weight": args.var_loss_weight,
             "loss_weight_q0": args.loss_weight_q0,
