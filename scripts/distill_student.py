@@ -313,6 +313,16 @@ def main():
                         "draws (defaults to --seed). Varying it with a fixed "
                         "--seed isolates optimisation variance from data "
                         "variance.")
+    parser.add_argument("--init-from", default=None,
+                        help="Path to a previously exported shared-trunk "
+                        "student pickle to continue training from (warm "
+                        "restart). Loads the trunk and head weights; the "
+                        "optimizer state is rebuilt from scratch, so pair "
+                        "this with --warmup-steps and a reduced --lr (e.g. "
+                        "1/3 of the previous cycle's peak) so the fresh "
+                        "Adam moments do not kick the model off its "
+                        "minimum. Requires --shared-trunk with matching "
+                        "architecture.")
     parser.add_argument("--output", default=None,
                         help="Output pickle path (default: "
                         "tglfnn_ukaea/weights/<machine>_student.pkl)")
@@ -375,6 +385,40 @@ def main():
         student_params = student_network.init(
             jax.random.key(init_seed), dummy
         )["params"]
+        if args.init_from:
+            with open(args.init_from, "rb") as f:
+                src = pickle.load(f)
+            src_labels = tuple(src["params"].keys())
+            if src_labels != output_labels:
+                raise SystemExit(
+                    f"--init-from flux labels {src_labels} do not match "
+                    f"teacher {output_labels}"
+                )
+            if (
+                src["config"]["model_size"] != args.num_hiddens
+                or src["config"]["hidden_size"] != args.hidden_size
+            ):
+                raise SystemExit("--init-from architecture mismatch")
+            restored = {}
+            for j in range(args.num_hiddens - 1):
+                lay = src["params"][src_labels[0]]["MLP_0"][
+                    f"FullyConnectedLayer_{j}"
+                ]
+                restored[f"Trunk_{j}"] = {
+                    "kernel": jnp.array(lay["weight"].T),
+                    "bias": jnp.array(lay["bias"]),
+                }
+            last = f"FullyConnectedLayer_{args.num_hiddens - 1}"
+            for i, label in enumerate(src_labels):
+                lay = src["params"][label]["MLP_0"][last]
+                # Row 0 of the exported 2-unit output layer is the mean
+                # head; row 1 is the constant-variance column, dropped here.
+                restored[f"Head_{i}"] = {
+                    "kernel": jnp.array(lay["weight"][0:1].T),
+                    "bias": jnp.array(lay["bias"][0:1]),
+                }
+            student_params = restored
+            print(f"Initialised student from {args.init_from}")
     else:
         student_network = networks.GaussianMLPEnsemble(
             n_ensemble=1,
@@ -694,6 +738,7 @@ def main():
             "decay_fraction": args.decay_fraction,
             "dtype": args.dtype,
             "resample_every": args.resample_every,
+            "init_from": args.init_from,
             "weight_decay": args.weight_decay,
             "var_loss_weight": args.var_loss_weight,
             "loss_weight_q0": args.loss_weight_q0,
