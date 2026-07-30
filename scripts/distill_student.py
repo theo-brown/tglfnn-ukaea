@@ -161,6 +161,17 @@ def main():
     parser.add_argument("--steps", type=int, default=4000)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--var-loss-weight", type=float, default=0.1)
+    parser.add_argument("--threshold-q0", type=float, default=10.0,
+                        help="Scale (in GB units) of the threshold-weighted "
+                        "minibatch sampling: samples are drawn with "
+                        "probability proportional to the per-flux average of "
+                        "1/(|flux| + q0), concentrating training on the "
+                        "near-threshold region that dominates stiff "
+                        "flux-driven transport simulations.")
+    parser.add_argument("--uniform-fraction", type=float, default=0.3,
+                        help="Fraction of the sampling probability assigned "
+                        "uniformly, so the high-flux tail stays anchored. "
+                        "1.0 recovers unweighted (uniform) sampling.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", default=None,
                         help="Output pickle path (default: "
@@ -218,6 +229,31 @@ def main():
     var_weight = args.var_loss_weight
     eps = 1e-6
 
+    # Threshold-weighted minibatch sampling: probability proportional to a
+    # mixture of uniform and the per-flux average of 1/(|flux_GB| + q0),
+    # implemented as inverse-CDF sampling inside the jitted train step.
+    out_stds_dev = jnp.array(
+        [teacher_dict["stats"][label]["std"] for label in output_labels]
+    )
+    out_means_dev = jnp.array(
+        [teacher_dict["stats"][label]["mean"] for label in output_labels]
+    )
+    flux_gb = jnp.abs(
+        y_train_dev[..., 0] * out_stds_dev[:, None] + out_means_dev[:, None]
+    )  # (n_fluxes, n_samples)
+    near_threshold_weight = jnp.mean(
+        1.0 / (flux_gb + args.threshold_q0), axis=0
+    )
+    n_pool = z_train_dev.shape[0]
+    probabilities = (
+        args.uniform_fraction / n_pool
+        + (1.0 - args.uniform_fraction)
+        * near_threshold_weight
+        / jnp.sum(near_threshold_weight)
+    )
+    sampling_cdf = jnp.cumsum(probabilities)
+    sampling_cdf = sampling_cdf / sampling_cdf[-1]
+
     def loss_fn(params, z, y):
         pred = jax.vmap(
             lambda p: student_network.apply(
@@ -232,9 +268,8 @@ def main():
 
     @jax.jit
     def train_step(params, opt_state, key):
-        idx = jax.random.randint(
-            key, (args.batch_size,), 0, z_train_dev.shape[0]
-        )
+        uniforms = jax.random.uniform(key, (args.batch_size,))
+        idx = jnp.searchsorted(sampling_cdf, uniforms)
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
             params, z_train_dev[idx], y_train_dev[:, idx]
         )
@@ -327,6 +362,8 @@ def main():
             "batch_size": args.batch_size,
             "lr": args.lr,
             "var_loss_weight": args.var_loss_weight,
+            "threshold_q0": args.threshold_q0,
+            "uniform_fraction": args.uniform_fraction,
             "seed": args.seed,
             "metrics": metrics,
         },
