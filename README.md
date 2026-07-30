@@ -129,6 +129,18 @@ is the teacher's total (aleatoric + epistemic) uncertainty folded into a
 single channel, and the ensemble-spread decomposition is no longer
 available.
 
+**Selecting a student checkpoint**: offline metrics (box RMSE,
+near-threshold RMSE, sign agreement) are necessary but not sufficient.
+Retraining with an identical recipe and near-identical offline metrics has
+produced students whose behaviour inside a flux-driven transport
+simulation (TORAX, ITER hybrid case) differed substantially — the
+self-consistent state sits near marginal stability, where small residual
+biases the offline metrics do not resolve are amplified by the solver.
+Candidate students should therefore be run through integrated-modelling
+acceptance cases (a student evaluation costs ~1 s per TORAX run) and
+selected on in-simulation fidelity, not offline metrics alone. The
+packaged `multimachine_student.pkl` was selected this way.
+
 ## 6. Compare TGLF and TGLFNN in JETTO production runs
 
 - TGLFNN is only an approximation of TGLF and it will make mistakes
