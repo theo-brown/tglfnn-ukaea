@@ -61,30 +61,42 @@ class SharedTrunkMeanStudent(nn.Module):
     layer so the checkpoint still loads through ``GaussianMLPEnsemble``.
 
     ``num_hiddens`` counts Dense layers per flux in the *exported* network
-    (matching ``model_size`` in the config): ``num_hiddens - 1`` shared trunk
-    layers plus the per-flux head.
+    (matching ``model_size`` in the config): ``num_hiddens - 1 -
+    head_hiddens`` shared trunk layers, then ``head_hiddens`` per-flux
+    hidden layers, then the per-flux output layer. ``head_hiddens`` moves
+    capacity from the shared trunk into the branches at fixed total depth.
     """
 
     num_hiddens: int
     hidden_size: int
     activation: str
     n_heads: int
+    head_hiddens: int = 0
     dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, x):
         act = _ACTIVATIONS[self.activation]
         x = x.astype(self.dtype)
-        for j in range(self.num_hiddens - 1):
+        n_trunk = self.num_hiddens - 1 - self.head_hiddens
+        for j in range(n_trunk):
             x = act(
                 nn.Dense(
                     self.hidden_size, name=f"Trunk_{j}", dtype=self.dtype
                 )(x)
             )
-        heads = [
-            nn.Dense(1, name=f"Head_{i}", dtype=self.dtype)(x)
-            for i in range(self.n_heads)
-        ]
+        heads = []
+        for i in range(self.n_heads):
+            h = x
+            for k in range(self.head_hiddens):
+                h = act(
+                    nn.Dense(
+                        self.hidden_size,
+                        name=f"Head_{i}_Hidden_{k}",
+                        dtype=self.dtype,
+                    )(h)
+                )
+            heads.append(nn.Dense(1, name=f"Head_{i}", dtype=self.dtype)(h))
         # Params stay float32 (Flax default param_dtype); only the compute
         # runs in self.dtype. Return float32 so the loss is accumulated at
         # full precision.
@@ -211,6 +223,19 @@ def main():
                         choices=["relu", "tanh", "sigmoid"],
                         help="tanh gives a smooth surrogate, which helps "
                         "Newton-type transport solvers converge.")
+    parser.add_argument("--head-hiddens", type=int, default=0,
+                        help="Shared-trunk mode only: number of per-flux "
+                        "hidden layers in each head branch. Moves capacity "
+                        "from the shared trunk to the branches at fixed "
+                        "total depth (num_hiddens counts trunk + head "
+                        "hidden + output layers per exported flux network).")
+    parser.add_argument("--pool-cache", default=None,
+                        help="Path to an .npz cache for the initial "
+                        "training pool and validation set. Loaded if it "
+                        "exists, created otherwise. Only valid when runs "
+                        "share the same --seed/--n-train/--n-val/"
+                        "--oob-fraction; useful for architecture scans that "
+                        "reuse one labelled pool.")
     parser.add_argument("--shared-trunk", action="store_true",
                         help="Train a single mean-only network with a shared "
                         "trunk and one linear head per flux, instead of an "
@@ -338,9 +363,13 @@ def main():
           f"{teacher_network.n_ensemble}x{teacher_network.hidden_size}-wide x "
           f"{teacher_network.num_hiddens}-layer per flux")
     if args.shared_trunk:
+        n_trunk = args.num_hiddens - 1 - args.head_hiddens
+        if n_trunk < 1:
+            raise SystemExit("--head-hiddens leaves no trunk layers")
         print(f"Student: shared {args.hidden_size}-wide x "
-              f"{args.num_hiddens - 1}-layer trunk ({args.activation}) + "
-              f"{n_fluxes} linear mean heads (variance not learned)")
+              f"{n_trunk}-layer trunk ({args.activation}) + "
+              f"{n_fluxes} mean heads with {args.head_hiddens} hidden "
+              f"layer(s) each (variance not learned)")
     else:
         print(f"Student: 1x{args.hidden_size}-wide x {args.num_hiddens}-layer "
               f"({args.activation}) per flux")
@@ -362,12 +391,30 @@ def main():
         y = teacher_labels(teacher_network, teacher_params, z)
         return z, jnp.asarray(y)
 
-    z_train_dev, y_train_dev = make_pool(rng)
-    x_val = sample_inputs(teacher_dict, args.n_val, rng)
-    z_val = (jnp.asarray(x_val) - in_means) / in_stds
-    y_val = teacher_labels(teacher_network, teacher_params, z_val)
-    print(f"Labelled {args.n_train}+{args.n_val} samples with the teacher in "
-          f"{time.time() - t0:.1f}s")
+    if args.pool_cache and pathlib.Path(args.pool_cache).exists():
+        cached = np.load(args.pool_cache)
+        z_train_dev = jnp.asarray(cached["z_train"])
+        y_train_dev = jnp.asarray(cached["y_train"])
+        z_val = jnp.asarray(cached["z_val"])
+        y_val = cached["y_val"]
+        print(f"Loaded pool cache from {args.pool_cache} in "
+              f"{time.time() - t0:.1f}s")
+    else:
+        z_train_dev, y_train_dev = make_pool(rng)
+        x_val = sample_inputs(teacher_dict, args.n_val, rng)
+        z_val = (jnp.asarray(x_val) - in_means) / in_stds
+        y_val = teacher_labels(teacher_network, teacher_params, z_val)
+        print(f"Labelled {args.n_train}+{args.n_val} samples with the "
+              f"teacher in {time.time() - t0:.1f}s")
+        if args.pool_cache:
+            np.savez(
+                args.pool_cache,
+                z_train=np.asarray(z_train_dev),
+                y_train=np.asarray(y_train_dev),
+                z_val=np.asarray(z_val),
+                y_val=np.asarray(y_val),
+            )
+            print(f"Saved pool cache to {args.pool_cache}")
 
     # --- Student setup ----------------------------------------------------
     init_seed = args.init_seed if args.init_seed is not None else args.seed
@@ -380,6 +427,7 @@ def main():
             hidden_size=args.hidden_size,
             activation=args.activation,
             n_heads=n_fluxes,
+            head_hiddens=args.head_hiddens,
             dtype=jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32,
         )
         student_params = student_network.init(
@@ -394,13 +442,18 @@ def main():
                     f"--init-from flux labels {src_labels} do not match "
                     f"teacher {output_labels}"
                 )
+            src_head_hiddens = (
+                src["config"].get("distillation", {}).get("head_hiddens", 0)
+            )
             if (
                 src["config"]["model_size"] != args.num_hiddens
                 or src["config"]["hidden_size"] != args.hidden_size
+                or src_head_hiddens != args.head_hiddens
             ):
                 raise SystemExit("--init-from architecture mismatch")
+            n_trunk_init = args.num_hiddens - 1 - args.head_hiddens
             restored = {}
-            for j in range(args.num_hiddens - 1):
+            for j in range(n_trunk_init):
                 lay = src["params"][src_labels[0]]["MLP_0"][
                     f"FullyConnectedLayer_{j}"
                 ]
@@ -410,6 +463,14 @@ def main():
                 }
             last = f"FullyConnectedLayer_{args.num_hiddens - 1}"
             for i, label in enumerate(src_labels):
+                for k in range(args.head_hiddens):
+                    lay = src["params"][label]["MLP_0"][
+                        f"FullyConnectedLayer_{n_trunk_init + k}"
+                    ]
+                    restored[f"Head_{i}_Hidden_{k}"] = {
+                        "kernel": jnp.array(lay["weight"].T),
+                        "bias": jnp.array(lay["bias"]),
+                    }
                 lay = src["params"][label]["MLP_0"][last]
                 # Row 0 of the exported 2-unit output layer is the mean
                 # head; row 1 is the constant-variance column, dropped here.
@@ -669,11 +730,18 @@ def main():
         # weights are duplicated across fluxes, trading file size for
         # loading through the released inference path unchanged.
         mean_var_np = np.maximum(np.asarray(mean_var), eps)
+        n_trunk_out = args.num_hiddens - 1 - args.head_hiddens
         for i, label in enumerate(output_labels):
             layers = {}
-            for j in range(args.num_hiddens - 1):
+            for j in range(n_trunk_out):
                 dense = student_params[f"Trunk_{j}"]
                 layers[f"FullyConnectedLayer_{j}"] = {
+                    "weight": np.asarray(dense["kernel"]).T.astype(np.float32),
+                    "bias": np.asarray(dense["bias"]).T.astype(np.float32),
+                }
+            for k in range(args.head_hiddens):
+                dense = student_params[f"Head_{i}_Hidden_{k}"]
+                layers[f"FullyConnectedLayer_{n_trunk_out + k}"] = {
                     "weight": np.asarray(dense["kernel"]).T.astype(np.float32),
                     "bias": np.asarray(dense["bias"]).T.astype(np.float32),
                 }
@@ -739,6 +807,7 @@ def main():
             "dtype": args.dtype,
             "resample_every": args.resample_every,
             "init_from": args.init_from,
+            "head_hiddens": args.head_hiddens,
             "weight_decay": args.weight_decay,
             "var_loss_weight": args.var_loss_weight,
             "loss_weight_q0": args.loss_weight_q0,
