@@ -61,6 +61,20 @@ class ActiveLearningConfig:
     # stiff transport simulations) cost as much as large errors in the
     # strongly driven region. Set to 0 to disable and recover plain NLL.
     asinh_scale_gb: float = 10.0
+    # Optional pool of extra candidate inputs (an ``.npz`` file with an
+    # ``x`` array of shape ``(n, n_inputs)``), e.g. harvested from the
+    # points where an integrated-modelling code actually evaluates the
+    # surrogate. Simulation trajectories live on a low-dimensional,
+    # near-marginal manifold (and partly outside the training hypercube)
+    # that uniform hypercube sampling essentially never hits, so without
+    # this neither acquisition nor replay protects the region that
+    # determines simulation behaviour. Empty string disables.
+    candidate_pool_path: str = ""
+    # Fraction of each acquisition batch reserved for the highest-scoring
+    # not-yet-acquired pool points (when a pool is given).
+    pool_acquisition_fraction: float = 0.5
+    # Fraction of the replay points drawn from the pool (when given).
+    pool_replay_fraction: float = 0.5
     validation_fraction: float = 0.2
     seed: int = 0
     warm_start: bool = True  # Start from the shipped pretrained weights.
@@ -228,6 +242,15 @@ def run_active_learning(
     )
     output_dir = pathlib.Path(config.output_dir)
 
+    pool = None
+    if config.candidate_pool_path:
+        pool = jnp.asarray(np.load(config.candidate_pool_path)["x"])
+        pool_available = np.ones(len(pool), dtype=bool)
+        print(
+            f"Candidate pool: {len(pool)} points from "
+            f"{config.candidate_pool_path}"
+        )
+
     key = jax.random.key(config.seed)
     if config.warm_start:
         params_by_flux = {
@@ -270,14 +293,44 @@ def run_active_learning(
             candidate_key, config.n_candidates, input_labels, param_space
         )
         if config.acquisition == "ensemble_variance":
-            scores = acquisition_scores(
-                params_by_flux,
-                normalizer.normalize_inputs(candidates),
-                normalizer,
-                config.flux_cutoff_gb,
-                config.acquisition_margin_sigma,
-            )
-            batch_indices = jnp.argsort(scores)[-config.acquisition_batch :]
+
+            def scores_for(x_cand):
+                return acquisition_scores(
+                    params_by_flux,
+                    normalizer.normalize_inputs(x_cand),
+                    normalizer,
+                    config.flux_cutoff_gb,
+                    config.acquisition_margin_sigma,
+                )
+
+            n_from_pool = 0
+            if pool is not None:
+                n_from_pool = min(
+                    round(
+                        config.acquisition_batch
+                        * config.pool_acquisition_fraction
+                    ),
+                    int(pool_available.sum()),
+                )
+            batch_indices = jnp.argsort(scores_for(candidates))[
+                -(config.acquisition_batch - n_from_pool) :
+            ]
+            if n_from_pool > 0:
+                # Highest-disagreement pool points not yet labelled; once
+                # acquired they leave the pool so rounds don't relabel them.
+                available = np.flatnonzero(pool_available)
+                pool_order = np.asarray(
+                    jnp.argsort(scores_for(pool[available]))
+                )
+                picked = available[pool_order[-n_from_pool:]]
+                pool_available[picked] = False
+                candidates = jnp.concatenate([candidates, pool[picked]])
+                batch_indices = jnp.concatenate(
+                    [
+                        batch_indices,
+                        jnp.arange(len(candidates) - n_from_pool, len(candidates)),
+                    ]
+                )
         elif config.acquisition == "random":
             batch_indices = jax.random.choice(
                 acquisition_key,
@@ -309,11 +362,31 @@ def run_active_learning(
         use_replay = config.n_replay > 0 and config.warm_start
         if use_replay:
             key, replay_key = jax.random.split(key)
-            x_replay_norm = normalizer.normalize_inputs(
-                sample_inputs(
-                    replay_key, config.n_replay, input_labels, param_space
+            n_pool_replay = 0
+            if pool is not None:
+                n_pool_replay = min(
+                    round(config.n_replay * config.pool_replay_fraction),
+                    len(pool),
                 )
+            x_replay = sample_inputs(
+                replay_key,
+                config.n_replay - n_pool_replay,
+                input_labels,
+                param_space,
             )
+            if n_pool_replay > 0:
+                # Anchor the replay distillation on the pool manifold too —
+                # the pretrained teacher is typically accurate there, and
+                # hypercube samples alone essentially never cover it.
+                key, pool_replay_key = jax.random.split(key)
+                pool_idx = jax.random.choice(
+                    pool_replay_key,
+                    len(pool),
+                    (n_pool_replay,),
+                    replace=False,
+                )
+                x_replay = jnp.concatenate([x_replay, pool[pool_idx]])
+            x_replay_norm = normalizer.normalize_inputs(x_replay)
         train_losses = {}
         for i, label in enumerate(output_labels):
             y_train_norm = normalizer.normalize_output(
