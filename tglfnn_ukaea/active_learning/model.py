@@ -148,11 +148,22 @@ def gaussian_nll(
     y: jax.Array,
     key: jax.Array,
     dropout_rate: float,
+    weights: jax.Array | None = None,
 ) -> jax.Array:
-    """Mean Gaussian negative log-likelihood of one member on a batch."""
+    """(Weighted) mean Gaussian negative log-likelihood of one member.
+
+    ``weights`` are per-sample weights, normalised by their batch mean so the
+    effective learning rate is weighting-independent. Weighting by the squared
+    asinh Jacobian ``1 / (1 + (flux/s)^2)`` fits the model in asinh(flux)
+    space to first order, making small absolute errors near marginal
+    stability as costly as large ones in the strongly driven region.
+    """
     mean, var = mlp_apply(params, x, dropout_rate=dropout_rate, key=key)
     var = var + _VAR_FLOOR
-    return 0.5 * jnp.mean(jnp.log(var) + (y - mean) ** 2 / var)
+    nll = 0.5 * (jnp.log(var) + (y - mean) ** 2 / var)
+    if weights is None:
+        return jnp.mean(nll)
+    return jnp.sum(weights * nll) / (jnp.sum(weights) + 1e-12)
 
 
 def train_ensemble(
@@ -165,8 +176,10 @@ def train_ensemble(
     batch_size: int,
     learning_rate: float,
     dropout_rate: float = 0.0,
+    sample_weights: jax.Array | None = None,
     replay: Tuple[jax.Array, jax.Array] | None = None,
     replay_weight: float = 1.0,
+    replay_sample_weights: jax.Array | None = None,
 ) -> Tuple[Params, float]:
     """Trains all ensemble members of one flux with Adam on the Gaussian NLL.
 
@@ -182,12 +195,16 @@ def train_ensemble(
         batch_size: Minibatch size per member.
         learning_rate: Adam learning rate.
         dropout_rate: Hidden-layer dropout rate during training.
+        sample_weights: Optional per-sample loss weights, shape
+            ``(n_samples,)`` (see :func:`gaussian_nll`).
         replay: Optional distillation-replay data ``(x_replay, y_replay)``
             with shapes ``(n_replay, n_inputs)`` and *per-member* targets
             ``(n_members, n_replay)`` (normalised units) — typically each
             member's own frozen pretrained prediction. Anchors the model
             outside the acquired data without collapsing member diversity.
         replay_weight: Weight of the replay NLL relative to the data NLL.
+        replay_sample_weights: Optional per-member per-point loss weights for
+            the replay data, shape ``(n_members, n_replay)``.
 
     Returns:
         ``(trained_params, final_mean_loss)``.
@@ -202,13 +219,16 @@ def train_ensemble(
         x_replay, y_replay = replay
         n_replay = x_replay.shape[0]
         replay_batch_size = min(batch_size, n_replay)
+        if replay_sample_weights is None:
+            replay_sample_weights = jnp.ones_like(y_replay)
     else:
         # Dummy per-member targets so member_step keeps a fixed signature.
         y_replay = jnp.zeros((n_members, 1))
+        replay_sample_weights = jnp.ones((n_members, 1))
 
     @jax.jit
     def step(params, opt_state, key):
-        def member_step(params, opt_state, key, y_replay_member):
+        def member_step(params, opt_state, key, y_replay_member, w_replay_member):
             batch_key, dropout_key, replay_key, replay_dropout_key = (
                 jax.random.split(key, 4)
             )
@@ -218,7 +238,12 @@ def train_ensemble(
                     batch_key, (batch_size,), 0, n_samples
                 )
                 loss = gaussian_nll(
-                    params, x[idx], y[idx], dropout_key, dropout_rate
+                    params,
+                    x[idx],
+                    y[idx],
+                    dropout_key,
+                    dropout_rate,
+                    None if sample_weights is None else sample_weights[idx],
                 )
                 if replay is not None:
                     replay_idx = jax.random.randint(
@@ -230,6 +255,7 @@ def train_ensemble(
                         y_replay_member[replay_idx],
                         replay_dropout_key,
                         dropout_rate,
+                        w_replay_member[replay_idx],
                     )
                 return loss
 
@@ -238,7 +264,9 @@ def train_ensemble(
             return optax.apply_updates(params, updates), opt_state, loss
 
         keys = jax.random.split(key, n_members)
-        return jax.vmap(member_step)(params, opt_state, keys, y_replay)
+        return jax.vmap(member_step)(
+            params, opt_state, keys, y_replay, replay_sample_weights
+        )
 
     n_steps = epochs * max(1, n_samples // batch_size)
     losses = jnp.zeros(n_members)

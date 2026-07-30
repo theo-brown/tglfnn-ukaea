@@ -54,6 +54,13 @@ class ActiveLearningConfig:
     # warm_start.
     n_replay: int = 1024
     replay_weight: float = 1.0
+    # Scale (gyro-Bohm units) of the asinh loss weighting: samples are
+    # weighted by 1 / (1 + (flux / s)^2), the squared Jacobian of
+    # asinh(flux / s). This fits the model in asinh space to first order, so
+    # few-GB errors near marginal stability (which dominate the behaviour of
+    # stiff transport simulations) cost as much as large errors in the
+    # strongly driven region. Set to 0 to disable and recover plain NLL.
+    asinh_scale_gb: float = 10.0
     validation_fraction: float = 0.2
     seed: int = 0
     warm_start: bool = True  # Start from the shipped pretrained weights.
@@ -138,8 +145,14 @@ def evaluate(
     x: jax.Array,
     y: np.ndarray,
     output_labels: Sequence[str],
+    asinh_scale_gb: float = 10.0,
 ) -> Mapping[str, float]:
-    """Validation RMSE (gyro-Bohm units) and NLL (normalised) per flux."""
+    """Validation RMSE (gyro-Bohm and asinh space) and NLL per flux.
+
+    The asinh-space RMSE, ``rmse(asinh(pred/s) - asinh(true/s))``, is
+    sensitive to the small-|flux| near-marginal region that the plain RMSE
+    (dominated by the largest fluxes) cannot see.
+    """
     x_norm = normalizer.normalize_inputs(x)
     metrics = {}
     for i, label in enumerate(output_labels):
@@ -151,6 +164,17 @@ def evaluate(
         var = aleatoric + epistemic + model_lib._VAR_FLOOR
         metrics[f"rmse_{label}"] = float(
             jnp.sqrt(jnp.mean((mean - y[:, i]) ** 2))
+        )
+        metrics[f"asinh_rmse_{label}"] = float(
+            jnp.sqrt(
+                jnp.mean(
+                    (
+                        jnp.arcsinh(mean / asinh_scale_gb)
+                        - jnp.arcsinh(y[:, i] / asinh_scale_gb)
+                    )
+                    ** 2
+                )
+            )
         )
         metrics[f"nll_{label}"] = float(
             0.5 * jnp.mean(jnp.log(var) + (y_norm - mean_norm) ** 2 / var)
@@ -296,6 +320,7 @@ def run_active_learning(
                 jnp.asarray(y_data)[train_idx, i], label
             )
             replay = None
+            replay_sample_weights = None
             if use_replay:
                 # Member-wise pseudo-labels from the frozen pretrained
                 # ensemble: member m is distilled towards pretrained member
@@ -305,6 +330,19 @@ def run_active_learning(
                     lambda p: model_lib.mlp_apply(p, x_replay_norm)[0]
                 )(pretrained_by_flux[label])
                 replay = (x_replay_norm, replay_targets)
+                if config.asinh_scale_gb > 0:
+                    replay_gb = normalizer.unnormalize_output(
+                        replay_targets, label
+                    )
+                    replay_sample_weights = 1.0 / (
+                        1.0 + (replay_gb / config.asinh_scale_gb) ** 2
+                    )
+            sample_weights = None
+            if config.asinh_scale_gb > 0:
+                y_train_gb = jnp.asarray(y_data)[train_idx, i]
+                sample_weights = 1.0 / (
+                    1.0 + (y_train_gb / config.asinh_scale_gb) ** 2
+                )
             key, train_key = jax.random.split(key)
             params_by_flux[label], train_losses[label] = model_lib.train_ensemble(
                 params_by_flux[label],
@@ -315,8 +353,10 @@ def run_active_learning(
                 batch_size=config.batch_size,
                 learning_rate=config.learning_rate,
                 dropout_rate=config.dropout,
+                sample_weights=sample_weights,
                 replay=replay,
                 replay_weight=config.replay_weight,
+                replay_sample_weights=replay_sample_weights,
             )
 
         # 5. Report and checkpoint.
