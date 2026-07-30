@@ -72,14 +72,26 @@ def sample_inputs(
 
 
 def acquisition_scores(
-    params_by_flux: Mapping[str, model_lib.Params], x_norm: jax.Array
+    params_by_flux: Mapping[str, model_lib.Params],
+    x_norm: jax.Array,
+    normalizer: model_lib.Normalizer,
+    flux_cutoff_gb: Mapping[str, float],
 ) -> jax.Array:
-    """Ensemble disagreement, summed over fluxes (in normalised units)."""
+    """Ensemble disagreement, summed over fluxes (in normalised units).
+
+    Candidates whose *predicted* fluxes already exceed the training-data cuts
+    score ``-inf``: their TGLF labels would be discarded by
+    :func:`filter_valid` anyway, so labelling them wastes TGLF runs. (Without
+    this mask the loop stalls, because disagreement is largest precisely in
+    the super-critical corners of the hypercube.)"""
     total = jnp.zeros(x_norm.shape[0])
-    for stacked_params in params_by_flux.values():
-        _, _, epistemic_var = model_lib.predict(stacked_params, x_norm)
+    within_cuts = jnp.ones(x_norm.shape[0], dtype=bool)
+    for label, stacked_params in params_by_flux.items():
+        mean_norm, _, epistemic_var = model_lib.predict(stacked_params, x_norm)
         total += jnp.sqrt(epistemic_var)
-    return total
+        predicted = normalizer.unnormalize_output(mean_norm, label)
+        within_cuts &= jnp.abs(predicted) <= flux_cutoff_gb[label]
+    return jnp.where(within_cuts, total, -jnp.inf)
 
 
 def filter_valid(
@@ -203,7 +215,10 @@ def run_active_learning(
         )
         if config.acquisition == "ensemble_variance":
             scores = acquisition_scores(
-                params_by_flux, normalizer.normalize_inputs(candidates)
+                params_by_flux,
+                normalizer.normalize_inputs(candidates),
+                normalizer,
+                config.flux_cutoff_gb,
             )
             batch_indices = jnp.argsort(scores)[-config.acquisition_batch :]
         elif config.acquisition == "random":
