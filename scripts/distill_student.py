@@ -168,8 +168,34 @@ def main():
     parser.add_argument("--n-val", type=int, default=100_000)
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--steps", type=int, default=4000)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=3e-4,
+                        help="Peak learning rate.")
+    parser.add_argument("--schedule", default="cosine",
+                        choices=["cosine", "wsd"],
+                        help="LR schedule: 'cosine' decays from --lr over "
+                        "the whole run; 'wsd' (warmup-stable-decay) warms up "
+                        "over --warmup-steps, holds --lr flat, then decays "
+                        "over the final 20%% of steps. The stable phase "
+                        "makes plateaus diagnostic of convergence rather "
+                        "than of the annealing.")
+    parser.add_argument("--warmup-steps", type=int, default=500)
+    parser.add_argument("--weight-decay", type=float, default=1e-5,
+                        help="AdamW weight decay. Distillation targets are "
+                        "noiseless, so 0 is a reasonable choice.")
     parser.add_argument("--var-loss-weight", type=float, default=0.1)
+    parser.add_argument("--loss-weight-q0", type=float, default=0.0,
+                        help="If > 0 (in GB units), weight the loss "
+                        "per-sample-per-flux by q0^2/(q0^2 + flux_GB^2) "
+                        "(plus --loss-weight-floor). This is locally "
+                        "equivalent to training in asinh(flux/q0) space: "
+                        "relative-error matching above q0, absolute below - "
+                        "concentrating accuracy at operating-point flux "
+                        "magnitudes without changing the checkpoint's "
+                        "linear-output contract. 0 disables weighting.")
+    parser.add_argument("--loss-weight-floor", type=float, default=0.05,
+                        help="Uniform floor mixed into the loss weights so "
+                        "the high-flux tail keeps a minimum gradient "
+                        "signal.")
     parser.add_argument("--threshold-q0", type=float, default=10.0,
                         help="Scale (in GB units) of the threshold-weighted "
                         "minibatch sampling: samples are drawn with "
@@ -252,18 +278,29 @@ def main():
         ],
     )
 
-    schedule = optax.cosine_decay_schedule(args.lr, args.steps)
-    optimizer = optax.adamw(schedule, weight_decay=1e-5)
-    opt_state = optimizer.init(student_params)
+    if args.schedule == "wsd":
+        decay_steps = max(1, int(0.2 * args.steps))
+        stable_steps = max(0, args.steps - args.warmup_steps - decay_steps)
+        schedule = optax.join_schedules(
+            [
+                optax.linear_schedule(0.0, args.lr, args.warmup_steps),
+                optax.constant_schedule(args.lr),
+                optax.cosine_decay_schedule(args.lr, decay_steps),
+            ],
+            boundaries=[
+                args.warmup_steps,
+                args.warmup_steps + stable_steps,
+            ],
+        )
+    else:
+        schedule = optax.cosine_decay_schedule(args.lr, args.steps)
+    optimizer = optax.adamw(schedule, weight_decay=args.weight_decay)
 
     z_train_dev = jnp.asarray(z_train)
     y_train_dev = jnp.asarray(y_train)
     var_weight = args.var_loss_weight
     eps = 1e-6
 
-    # Threshold-weighted minibatch sampling: probability proportional to a
-    # mixture of uniform and the per-flux average of 1/(|flux_GB| + q0),
-    # implemented as inverse-CDF sampling inside the jitted train step.
     out_stds_dev = jnp.array(
         [teacher_dict["stats"][label]["std"] for label in output_labels]
     )
@@ -273,6 +310,33 @@ def main():
     flux_gb = jnp.abs(
         y_train_dev[..., 0] * out_stds_dev[:, None] + out_means_dev[:, None]
     )  # (n_fluxes, n_samples)
+
+    # Initialise the variance-head bias to the teacher's mean variance so
+    # early training is not spent dragging softplus(0) up to scale.
+    mean_var = jnp.mean(y_train_dev[..., 1], axis=1)
+    last_layer = f"Dense_{args.num_hiddens - 1}"
+    last_bias = student_params["GaussianMLP_0"][last_layer]["bias"]
+    student_params["GaussianMLP_0"][last_layer]["bias"] = last_bias.at[
+        :, 1
+    ].set(jnp.log(jnp.expm1(jnp.maximum(mean_var, eps))))
+
+    opt_state = optimizer.init(student_params)
+
+    # Per-sample-per-flux loss weights (asinh-equivalent error allocation).
+    if args.loss_weight_q0 > 0:
+        q0 = args.loss_weight_q0
+        relative = q0**2 / (q0**2 + flux_gb**2)
+        loss_weights = (
+            args.loss_weight_floor
+            + (1.0 - args.loss_weight_floor) * relative
+        )
+    else:
+        loss_weights = jnp.ones_like(flux_gb)
+    loss_weights = loss_weights / jnp.mean(loss_weights)
+
+    # Threshold-weighted minibatch sampling: probability proportional to a
+    # mixture of uniform and the per-flux average of 1/(|flux_GB| + q0),
+    # implemented as inverse-CDF sampling inside the jitted train step.
     near_threshold_weight = jnp.mean(
         1.0 / (flux_gb + args.threshold_q0), axis=0
     )
@@ -286,15 +350,15 @@ def main():
     sampling_cdf = jnp.cumsum(probabilities)
     sampling_cdf = sampling_cdf / sampling_cdf[-1]
 
-    def loss_fn(params, z, y):
+    def loss_fn(params, z, y, w):
         pred = jax.vmap(
             lambda p: student_network.apply(
                 {"params": p}, z, deterministic=True
             )
         )(params)
-        mean_loss = jnp.mean((pred[..., 0] - y[..., 0]) ** 2)
+        mean_loss = jnp.mean(w * (pred[..., 0] - y[..., 0]) ** 2)
         logvar_loss = jnp.mean(
-            (jnp.log(pred[..., 1] + eps) - jnp.log(y[..., 1] + eps)) ** 2
+            w * (jnp.log(pred[..., 1] + eps) - jnp.log(y[..., 1] + eps)) ** 2
         )
         return mean_loss + var_weight * logvar_loss, (mean_loss, logvar_loss)
 
@@ -303,7 +367,7 @@ def main():
         uniforms = jax.random.uniform(key, (args.batch_size,))
         idx = jnp.searchsorted(sampling_cdf, uniforms)
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            params, z_train_dev[idx], y_train_dev[:, idx]
+            params, z_train_dev[idx], y_train_dev[:, idx], loss_weights[:, idx]
         )
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
@@ -393,7 +457,12 @@ def main():
             "steps": args.steps,
             "batch_size": args.batch_size,
             "lr": args.lr,
+            "schedule": args.schedule,
+            "warmup_steps": args.warmup_steps,
+            "weight_decay": args.weight_decay,
             "var_loss_weight": args.var_loss_weight,
+            "loss_weight_q0": args.loss_weight_q0,
+            "loss_weight_floor": args.loss_weight_floor,
             "threshold_q0": args.threshold_q0,
             "uniform_fraction": args.uniform_fraction,
             "oob_fraction": args.oob_fraction,
