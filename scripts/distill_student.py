@@ -196,6 +196,18 @@ def main():
                         help="Uniform floor mixed into the loss weights so "
                         "the high-flux tail keeps a minimum gradient "
                         "signal.")
+    parser.add_argument("--sign-loss-weight", type=float, default=0.0,
+                        help="If > 0, adds a sign-consistency hinge "
+                        "relu(-pred_GB * teacher_GB)/q0^2 on the physical "
+                        "(unnormalised) fluxes. Sign-crossing fluxes (the "
+                        "particle flux pinch/outflow transition) feed the "
+                        "D_eff/V_eff decomposition in transport solvers, "
+                        "where a wrong sign flips the convection direction; "
+                        "plain MSE treats such errors as no worse than "
+                        "same-sign errors of equal size. The hinge is "
+                        "proportional to both magnitudes, so it vanishes "
+                        "near zero flux and never fights threshold noise. "
+                        "0 disables the term.")
     parser.add_argument("--threshold-q0", type=float, default=10.0,
                         help="Scale (in GB units) of the threshold-weighted "
                         "minibatch sampling: samples are drawn with "
@@ -350,6 +362,8 @@ def main():
     sampling_cdf = jnp.cumsum(probabilities)
     sampling_cdf = sampling_cdf / sampling_cdf[-1]
 
+    sign_scale = args.loss_weight_q0 if args.loss_weight_q0 > 0 else 10.0
+
     def loss_fn(params, z, y, w):
         pred = jax.vmap(
             lambda p: student_network.apply(
@@ -360,7 +374,18 @@ def main():
         logvar_loss = jnp.mean(
             w * (jnp.log(pred[..., 1] + eps) - jnp.log(y[..., 1] + eps)) ** 2
         )
-        return mean_loss + var_weight * logvar_loss, (mean_loss, logvar_loss)
+        # Sign-consistency hinge on physical fluxes: active only when the
+        # prediction and the teacher disagree in sign, scaled by both
+        # magnitudes (a confident wrong-sign costs more).
+        q_pred = pred[..., 0] * out_stds_dev[:, None] + out_means_dev[:, None]
+        q_true = y[..., 0] * out_stds_dev[:, None] + out_means_dev[:, None]
+        sign_loss = jnp.mean(jax.nn.relu(-q_pred * q_true)) / sign_scale**2
+        total = (
+            mean_loss
+            + var_weight * logvar_loss
+            + args.sign_loss_weight * sign_loss
+        )
+        return total, (mean_loss, logvar_loss, sign_loss)
 
     @jax.jit
     def train_step(params, opt_state, key):
@@ -384,6 +409,7 @@ def main():
         if step % 200 == 0 or step == args.steps - 1:
             print(f"step {step:5d} loss={float(loss):.5f} "
                   f"mean={float(aux[0]):.5f} logvar={float(aux[1]):.5f} "
+                  f"sign={float(aux[2]):.5f} "
                   f"({time.time() - t0:.0f}s)")
 
     # --- Validation against the teacher ----------------------------------
@@ -407,7 +433,18 @@ def main():
         # normalized-space R^2 equals physical-space R^2; RMSE is scaled back
         # to GB units.
         near = np.abs(teacher_mean * out_stds[i] + out_means[i]) < 10.0
+        # Sign agreement with the teacher where the physical flux is small
+        # enough that sign errors are plausible (|q| < 20 GB) - the region
+        # where the D_eff/V_eff decomposition is most sign-sensitive.
+        teacher_phys = teacher_mean * out_stds[i] + out_means[i]
+        student_phys = student_mean * out_stds[i] + out_means[i]
+        band = np.abs(teacher_phys) < 20.0
         metrics[label] = {
+            "sign_agreement_lt20gb": float(
+                np.mean(
+                    np.sign(student_phys[band]) == np.sign(teacher_phys[band])
+                )
+            ),
             "mean_r2": r2(teacher_mean, student_mean),
             "mean_rmse_gb": float(
                 np.sqrt(np.mean((teacher_mean - student_mean) ** 2))
