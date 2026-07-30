@@ -104,3 +104,8 @@ from tglfnn_ukaea import active_learning
 config = active_learning.ActiveLearningConfig(n_rounds=5, acquisition_batch=32)
 result = active_learning.run_active_learning(config)
 ```
+
+Note: as of July 2026, TORAX's `tglf2py` wrapper has two runtime bugs that
+make it report the compiled extension as missing and crash on assigning the
+`SHAPE_*` defaults. [patches/torax-tglf2py-runtime-fixes.patch](patches/torax-tglf2py-runtime-fixes.patch)
+fixes both (apply with `git am` in your TORAX checkout).

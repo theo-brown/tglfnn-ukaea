@@ -1,0 +1,74 @@
+From d6838b47952bfa1449fce8f28c011e21cb022c7b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 30 Jul 2026 05:21:34 +0000
+Subject: [PATCH] Fix two runtime bugs that disabled the compiled TGLF wrapper
+
+The tglf2py module was unusable even with a successfully compiled
+tglf2py_lib extension, due to two bugs found by building the extension
+against GACODE master and running it:
+
+1. tglf2py.py fetched tglf2py_lib.TGLFInterface at runtime, but that
+   class only exists in the type stub; the compiled f2py module exposes
+   tglf_interface as an untyped fortran object. The resulting
+   AttributeError was swallowed by the fallback except clause, so the
+   wrapper always reported the extension as not installed. Guard the
+   stub-only lookup with typing.TYPE_CHECKING.
+
+2. _assign_setting resolved GACODE parameter names to interface
+   variables as tglf_<name>_in, but the 22 SHAPE_COS*/SHAPE_SIN*
+   parameters map to variables with a _loc suffix (e.g. SHAPE_COS0 ->
+   tglf_shape_cos0_loc_in), so assigning the defaults always raised
+   AttributeError. Fall back to the _loc_in form when the plain key is
+   absent.
+
+After these fixes, run_tglf executes correctly (verified against the
+tglfnn-ukaea surrogate predictions on multiple points).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017itEmTQo2vAeApQu96EaNK
+---
+ torax/_src/transport_model/tglf/tglf2py.py | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/torax/_src/transport_model/tglf/tglf2py.py b/torax/_src/transport_model/tglf/tglf2py.py
+index 3436674..857f1c5 100644
+--- a/torax/_src/transport_model/tglf/tglf2py.py
++++ b/torax/_src/transport_model/tglf/tglf2py.py
+@@ -17,6 +17,7 @@
+ # users to install it manually.
+ 
+ import types
++import typing
+ from typing import Any
+ import numpy as np
+ from torax._src.transport_model.tglf import defaults as tglf_defaults
+@@ -30,7 +31,14 @@ try:
+   from torax._src.transport_model.tglf import tglf2py_lib  # pylint: disable=g-import-not-at-top
+ 
+   tglf_interface = tglf2py_lib.tglf_interface
+-  _TGLFInterfaceType = tglf2py_lib.TGLFInterface
++  if typing.TYPE_CHECKING:
++    # The TGLFInterface class only exists in the stub file; the compiled f2py
++    # module exposes 'tglf_interface' as an untyped fortran object, so looking
++    # up the class at runtime would raise AttributeError and wrongly disable
++    # the wrapper.
++    _TGLFInterfaceType = tglf2py_lib.TGLFInterface
++  else:
++    _TGLFInterfaceType = Any
+   _TGLF2pyLibType = types.ModuleType
+ except (ImportError, ModuleNotFoundError, AttributeError):
+   # At runtime, if the extension fails to import, then set it to None.
+@@ -86,6 +94,10 @@ def _assign_setting(key: str, value: str | bool | int | float | np.ndarray):
+     # Case 2: Scalar setting (e.g. USE_BPER, TAUE, etc.).
+     # Get previous value.
+     interface_key = f'tglf_{key_lower}_in'
++    if not hasattr(interface, interface_key):
++      # Some GACODE parameter names map to interface variables with a '_loc'
++      # suffix (e.g. SHAPE_COS0 -> tglf_shape_cos0_loc_in).
++      interface_key = f'tglf_{key_lower}_loc_in'
+     previous_value = getattr(interface, interface_key)
+ 
+     # Parse based on type of previous value.
+-- 
+2.43.0
+
