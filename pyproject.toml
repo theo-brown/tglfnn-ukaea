@@ -20,13 +20,14 @@ dependencies = ["numpy>2"]
 
 [project.optional-dependencies]
 dev = ["pandas","matplotlib"]
+active-learning = ["jax","optax"]
 
 [project.urls]
 Homepage = "https://github.com/ukaea/tglfnn-ukaea/"
 Repository = "https://github.com/ukaea/tglfnn-ukaea/"
 
 [tool.setuptools]
-packages = ["tglfnn_ukaea"]
+packages = ["tglfnn_ukaea", "tglfnn_ukaea.active_learning"]
 
 [tool.setuptools.package-data]
 # Force the packager to include the pickled weights files

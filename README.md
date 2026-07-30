@@ -76,3 +76,31 @@ Further details on the FTorch Implementation of these networks can be found in a
 
 - TGLFNN is only an approximation of TGLF and it will make mistakes
 - [scripts/tglf_vs_nn_jetto_trajectories.py](scripts/tglf_vs_nn_jetto_trajectories.py) shows how to plot the inputs and outputs spanned by TGLF and TGLFNN in a JETTO production run. **NOTE**: Available only in the following build on the JDC `/home/tn2395/jintrac-devel`
+# Active learning
+
+`tglfnn_ukaea.active_learning` contains a simple JAX active learning loop for
+improving the surrogates. Each round it samples candidate points from the
+model's training hypercube, selects the points where the ensemble members
+disagree most (epistemic uncertainty), labels them by running TGLF through
+[TORAX](https://github.com/google-deepmind/torax)'s `tglf2py` wrapper (the
+only TORAX component used), fine-tunes the ensembles on the accumulated data,
+and saves checkpoints in the same pickle format as the shipped weights.
+
+```bash
+pip install -e .[active-learning]
+# Requires TORAX with its compiled TGLF wrapper for real labelling:
+# https://torax.readthedocs.io/en/latest/installation.html#optional-install-tglf
+python scripts/run_active_learning.py --n-rounds 10 --acquisition-batch 64
+
+# Dry run without TGLF installed:
+python scripts/run_active_learning.py --mock-oracle
+```
+
+Or from Python:
+
+```python
+from tglfnn_ukaea import active_learning
+
+config = active_learning.ActiveLearningConfig(n_rounds=5, acquisition_batch=32)
+result = active_learning.run_active_learning(config)
+```
