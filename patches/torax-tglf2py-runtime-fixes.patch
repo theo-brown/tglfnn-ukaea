@@ -1,7 +1,8 @@
 From d6838b47952bfa1449fce8f28c011e21cb022c7b Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 30 Jul 2026 05:21:34 +0000
-Subject: [PATCH] Fix two runtime bugs that disabled the compiled TGLF wrapper
+Subject: [PATCH 1/2] Fix two runtime bugs that disabled the compiled TGLF
+ wrapper
 
 The tglf2py module was unusable even with a successfully compiled
 tglf2py_lib extension, due to two bugs found by building the extension
@@ -69,6 +70,51 @@ index 3436674..857f1c5 100644
      previous_value = getattr(interface, interface_key)
  
      # Parse based on type of previous value.
+-- 
+2.43.0
+
+
+From 5240cdb132e81c2c05d1f51f6a5946291e8355aa Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 30 Jul 2026 07:24:36 +0000
+Subject: [PATCH 2/2] Fix pure_callback result structure in TGLF transport
+ model
+
+The callback returns a 3-tuple of face arrays, but result_shape_dtypes
+declared a 4-field TurbulentTransport, so jax.pure_callback returned a
+TurbulentTransport that the 3-value unpack immediately crashed on
+(TypeError: cannot unpack non-iterable TurbulentTransport object) at the
+first transport call of any simulation with model_name='tglf' and a
+working tglf2py build. Declare the matching 3-tuple instead.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017itEmTQo2vAeApQu96EaNK
+---
+ .../_src/transport_model/tglf/tglf_transport_model.py | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/torax/_src/transport_model/tglf/tglf_transport_model.py b/torax/_src/transport_model/tglf/tglf_transport_model.py
+index 0905952..7e5c280 100644
+--- a/torax/_src/transport_model/tglf/tglf_transport_model.py
++++ b/torax/_src/transport_model/tglf/tglf_transport_model.py
+@@ -222,11 +222,12 @@ class TGLFTransportModel(tglf_based_transport_model.TGLFBasedTransportModel):
+     face_array_shape_dtype = jax.ShapeDtypeStruct(
+         shape=(n_faces,), dtype=jax_utils.get_dtype()
+     )
+-    result_shape_dtypes = transport_model.TurbulentTransport(
+-        chi_face_ion=face_array_shape_dtype,  # pyrefly: ignore[bad-argument-type]
+-        chi_face_el=face_array_shape_dtype,  # pyrefly: ignore[bad-argument-type]
+-        d_face_el=face_array_shape_dtype,  # pyrefly: ignore[bad-argument-type]
+-        v_face_el=face_array_shape_dtype,  # pyrefly: ignore[bad-argument-type]
++    # Must match the structure returned by callback(): a 3-tuple of
++    # (electron_heat_flux, total_ion_heat_flux, electron_particle_flux).
++    result_shape_dtypes = (
++        face_array_shape_dtype,
++        face_array_shape_dtype,
++        face_array_shape_dtype,
+     )
+ 
+     # We must pass local_settings_dict explicitly as an argument (*args) to
 -- 
 2.43.0
 
