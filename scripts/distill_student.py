@@ -101,15 +101,24 @@ _LOG10_SAMPLED_INPUTS = ("XNUE", "BETAE")
 
 
 def sample_inputs(
-    model_dict: Mapping[str, Any], n: int, rng: np.random.Generator
+    model_dict: Mapping[str, Any],
+    n: int,
+    rng: np.random.Generator,
+    margin: float = 0.0,
 ) -> np.ndarray:
-    """Uniformly samples the training hypercube recorded in the checkpoint."""
+    """Uniformly samples the training hypercube recorded in the checkpoint.
+
+    With ``margin > 0``, each dimension's bounds are extended by that
+    fraction of its range on both sides (in log10 space for log-sampled
+    inputs), so the sample covers a neighbourhood of the training box.
+    """
     param_space = model_dict["config"]["param_space"]
     columns = []
     for label in model_dict["input_labels"]:
         bounds = param_space[label]
         lo, hi = float(bounds[0]), float(bounds[1])
-        values = rng.uniform(lo, hi, size=n)
+        pad = margin * (hi - lo)
+        values = rng.uniform(lo - pad, hi + pad, size=n)
         if label in _LOG10_SAMPLED_INPUTS:
             values = 10.0**values
         columns.append(values)
@@ -172,6 +181,17 @@ def main():
                         help="Fraction of the sampling probability assigned "
                         "uniformly, so the high-flux tail stays anchored. "
                         "1.0 recovers unweighted (uniform) sampling.")
+    parser.add_argument("--oob-fraction", type=float, default=0.25,
+                        help="Fraction of the training pool drawn from a "
+                        "margin-extended hypercube instead of the training "
+                        "box, so the student matches the teacher in the "
+                        "out-of-box neighbourhood that transport solvers "
+                        "routinely query (e.g. high elongation). "
+                        "0.0 recovers box-only sampling.")
+    parser.add_argument("--oob-margin", type=float, default=0.25,
+                        help="Margin for --oob-fraction sampling, as a "
+                        "fraction of each dimension's range added to both "
+                        "sides of the box.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", default=None,
                         help="Output pickle path (default: "
@@ -193,7 +213,11 @@ def main():
     # --- Distillation data ------------------------------------------------
     rng = np.random.default_rng(args.seed)
     t0 = time.time()
-    x_train = sample_inputs(teacher_dict, args.n_train, rng)
+    n_oob = int(args.n_train * args.oob_fraction)
+    x_train = np.concatenate([
+        sample_inputs(teacher_dict, args.n_train - n_oob, rng),
+        sample_inputs(teacher_dict, n_oob, rng, margin=args.oob_margin),
+    ])
     x_val = sample_inputs(teacher_dict, args.n_val, rng)
     z_train = (jnp.asarray(x_train) - in_means) / in_stds
     z_val = (jnp.asarray(x_val) - in_means) / in_stds
@@ -364,6 +388,8 @@ def main():
             "var_loss_weight": args.var_loss_weight,
             "threshold_q0": args.threshold_q0,
             "uniform_fraction": args.uniform_fraction,
+            "oob_fraction": args.oob_fraction,
+            "oob_margin": args.oob_margin,
             "seed": args.seed,
             "metrics": metrics,
         },
