@@ -17,7 +17,10 @@ changes, at roughly 26x fewer FLOPs per evaluation than the teacher.
 
 The student architecture itself is fusion_surrogates'
 ``networks.GaussianMLPEnsemble`` (with ``n_ensemble=1``), so training and
-inference use literally the same Flax module.
+inference use literally the same Flax module. Alternatively,
+``--shared-trunk`` trains a single mean-only network (shared trunk, one
+linear head per flux) and exports it per flux with the trunk duplicated and
+a constant per-flux variance, so it still loads through the same path.
 
 Requires: fusion_surrogates (pip install fusion_surrogates), which brings in
 jax, flax and optax.
@@ -35,6 +38,7 @@ import pickle
 import time
 from typing import Any, Mapping
 
+import flax.linen as nn
 from fusion_surrogates.common import networks
 import jax
 import jax.numpy as jnp
@@ -42,6 +46,39 @@ import numpy as np
 import optax
 
 import tglfnn_ukaea
+
+_ACTIVATIONS = {"relu": jax.nn.relu, "tanh": jnp.tanh, "sigmoid": jax.nn.sigmoid}
+
+
+class SharedTrunkMeanStudent(nn.Module):
+    """Mean-only student: one shared trunk, one linear head per flux.
+
+    The three fluxes share a single representation, so the well-constrained
+    heat channels regularise the particle channel (the persistently
+    worst-distilled output). Only the ensemble mean is learned; the exported
+    checkpoint carries the teacher's average total variance per flux as a
+    constant, wired into the (otherwise unused) variance column of the final
+    layer so the checkpoint still loads through ``GaussianMLPEnsemble``.
+
+    ``num_hiddens`` counts Dense layers per flux in the *exported* network
+    (matching ``model_size`` in the config): ``num_hiddens - 1`` shared trunk
+    layers plus the per-flux head.
+    """
+
+    num_hiddens: int
+    hidden_size: int
+    activation: str
+    n_heads: int
+
+    @nn.compact
+    def __call__(self, x):
+        act = _ACTIVATIONS[self.activation]
+        for j in range(self.num_hiddens - 1):
+            x = act(nn.Dense(self.hidden_size, name=f"Trunk_{j}")(x))
+        heads = [
+            nn.Dense(1, name=f"Head_{i}")(x) for i in range(self.n_heads)
+        ]
+        return jnp.concatenate(heads, axis=-1)  # (batch, n_heads)
 
 
 def build_teacher(model_dict: Mapping[str, Any]):
@@ -164,6 +201,16 @@ def main():
                         choices=["relu", "tanh", "sigmoid"],
                         help="tanh gives a smooth surrogate, which helps "
                         "Newton-type transport solvers converge.")
+    parser.add_argument("--shared-trunk", action="store_true",
+                        help="Train a single mean-only network with a shared "
+                        "trunk and one linear head per flux, instead of an "
+                        "independent Gaussian MLP per flux. The shared "
+                        "representation regularises the particle channel via "
+                        "the heat channels. The variance is NOT learned: the "
+                        "exported checkpoint carries the teacher's average "
+                        "total variance per flux as a constant (variance "
+                        "column of the final layer), so it still loads "
+                        "through the released GaussianMLPEnsemble path.")
     parser.add_argument("--n-train", type=int, default=1_000_000)
     parser.add_argument("--n-val", type=int, default=100_000)
     parser.add_argument("--batch-size", type=int, default=4096)
@@ -252,8 +299,13 @@ def main():
     print(f"Teacher: {args.machine}, fluxes={output_labels}, "
           f"{teacher_network.n_ensemble}x{teacher_network.hidden_size}-wide x "
           f"{teacher_network.num_hiddens}-layer per flux")
-    print(f"Student: 1x{args.hidden_size}-wide x {args.num_hiddens}-layer "
-          f"({args.activation}) per flux")
+    if args.shared_trunk:
+        print(f"Student: shared {args.hidden_size}-wide x "
+              f"{args.num_hiddens - 1}-layer trunk ({args.activation}) + "
+              f"{n_fluxes} linear mean heads (variance not learned)")
+    else:
+        print(f"Student: 1x{args.hidden_size}-wide x {args.num_hiddens}-layer "
+              f"({args.activation}) per flux")
 
     # --- Distillation data ------------------------------------------------
     rng = np.random.default_rng(args.seed)
@@ -272,23 +324,34 @@ def main():
           f"{time.time() - t0:.1f}s")
 
     # --- Student setup ----------------------------------------------------
-    student_network = networks.GaussianMLPEnsemble(
-        n_ensemble=1,
-        num_hiddens=args.num_hiddens,
-        hidden_size=args.hidden_size,
-        dropout=0.0,
-        activation=args.activation,
-    )
     init_seed = args.init_seed if args.init_seed is not None else args.seed
-    init_keys = jax.random.split(jax.random.key(init_seed), n_fluxes)
     dummy = jnp.zeros((1, n_inputs))
-    student_params = jax.tree.map(
-        lambda *args_: jnp.stack(args_),
-        *[
-            student_network.init(k, dummy, deterministic=True)["params"]
-            for k in init_keys
-        ],
-    )
+    if args.shared_trunk:
+        student_network = SharedTrunkMeanStudent(
+            num_hiddens=args.num_hiddens,
+            hidden_size=args.hidden_size,
+            activation=args.activation,
+            n_heads=n_fluxes,
+        )
+        student_params = student_network.init(
+            jax.random.key(init_seed), dummy
+        )["params"]
+    else:
+        student_network = networks.GaussianMLPEnsemble(
+            n_ensemble=1,
+            num_hiddens=args.num_hiddens,
+            hidden_size=args.hidden_size,
+            dropout=0.0,
+            activation=args.activation,
+        )
+        init_keys = jax.random.split(jax.random.key(init_seed), n_fluxes)
+        student_params = jax.tree.map(
+            lambda *args_: jnp.stack(args_),
+            *[
+                student_network.init(k, dummy, deterministic=True)["params"]
+                for k in init_keys
+            ],
+        )
 
     if args.schedule == "wsd":
         decay_steps = max(1, int(0.2 * args.steps))
@@ -323,14 +386,18 @@ def main():
         y_train_dev[..., 0] * out_stds_dev[:, None] + out_means_dev[:, None]
     )  # (n_fluxes, n_samples)
 
-    # Initialise the variance-head bias to the teacher's mean variance so
-    # early training is not spent dragging softplus(0) up to scale.
+    # Teacher's mean total variance per flux: the variance-head bias init for
+    # the Gaussian student, or the constant exported variance for the
+    # mean-only shared-trunk student.
     mean_var = jnp.mean(y_train_dev[..., 1], axis=1)
-    last_layer = f"Dense_{args.num_hiddens - 1}"
-    last_bias = student_params["GaussianMLP_0"][last_layer]["bias"]
-    student_params["GaussianMLP_0"][last_layer]["bias"] = last_bias.at[
-        :, 1
-    ].set(jnp.log(jnp.expm1(jnp.maximum(mean_var, eps))))
+    if not args.shared_trunk:
+        # Initialise the variance-head bias to the teacher's mean variance so
+        # early training is not spent dragging softplus(0) up to scale.
+        last_layer = f"Dense_{args.num_hiddens - 1}"
+        last_bias = student_params["GaussianMLP_0"][last_layer]["bias"]
+        student_params["GaussianMLP_0"][last_layer]["bias"] = last_bias.at[
+            :, 1
+        ].set(jnp.log(jnp.expm1(jnp.maximum(mean_var, eps))))
 
     opt_state = optimizer.init(student_params)
 
@@ -364,28 +431,44 @@ def main():
 
     sign_scale = args.loss_weight_q0 if args.loss_weight_q0 > 0 else 10.0
 
-    def loss_fn(params, z, y, w):
-        pred = jax.vmap(
-            lambda p: student_network.apply(
-                {"params": p}, z, deterministic=True
-            )
-        )(params)
-        mean_loss = jnp.mean(w * (pred[..., 0] - y[..., 0]) ** 2)
-        logvar_loss = jnp.mean(
-            w * (jnp.log(pred[..., 1] + eps) - jnp.log(y[..., 1] + eps)) ** 2
-        )
+    def _sign_hinge(pred_mean, true_mean):
         # Sign-consistency hinge on physical fluxes: active only when the
         # prediction and the teacher disagree in sign, scaled by both
         # magnitudes (a confident wrong-sign costs more).
-        q_pred = pred[..., 0] * out_stds_dev[:, None] + out_means_dev[:, None]
-        q_true = y[..., 0] * out_stds_dev[:, None] + out_means_dev[:, None]
-        sign_loss = jnp.mean(jax.nn.relu(-q_pred * q_true)) / sign_scale**2
-        total = (
-            mean_loss
-            + var_weight * logvar_loss
-            + args.sign_loss_weight * sign_loss
-        )
-        return total, (mean_loss, logvar_loss, sign_loss)
+        q_pred = pred_mean * out_stds_dev[:, None] + out_means_dev[:, None]
+        q_true = true_mean * out_stds_dev[:, None] + out_means_dev[:, None]
+        return jnp.mean(jax.nn.relu(-q_pred * q_true)) / sign_scale**2
+
+    if args.shared_trunk:
+
+        def loss_fn(params, z, y, w):
+            # (batch, n_fluxes) -> (n_fluxes, batch), matching y/w layout.
+            pred_mean = student_network.apply({"params": params}, z).T
+            mean_loss = jnp.mean(w * (pred_mean - y[..., 0]) ** 2)
+            sign_loss = _sign_hinge(pred_mean, y[..., 0])
+            total = mean_loss + args.sign_loss_weight * sign_loss
+            return total, (mean_loss, jnp.zeros(()), sign_loss)
+
+    else:
+
+        def loss_fn(params, z, y, w):
+            pred = jax.vmap(
+                lambda p: student_network.apply(
+                    {"params": p}, z, deterministic=True
+                )
+            )(params)
+            mean_loss = jnp.mean(w * (pred[..., 0] - y[..., 0]) ** 2)
+            logvar_loss = jnp.mean(
+                w
+                * (jnp.log(pred[..., 1] + eps) - jnp.log(y[..., 1] + eps)) ** 2
+            )
+            sign_loss = _sign_hinge(pred[..., 0], y[..., 0])
+            total = (
+                mean_loss
+                + var_weight * logvar_loss
+                + args.sign_loss_weight * sign_loss
+            )
+            return total, (mean_loss, logvar_loss, sign_loss)
 
     @jax.jit
     def train_step(params, opt_state, key):
@@ -413,13 +496,23 @@ def main():
                   f"({time.time() - t0:.0f}s)")
 
     # --- Validation against the teacher ----------------------------------
-    student_val = np.asarray(
-        jax.vmap(
-            lambda p: student_network.apply(
-                {"params": p}, z_val, deterministic=True
-            )
-        )(student_params)
-    )
+    if args.shared_trunk:
+        val_means = np.asarray(
+            student_network.apply({"params": student_params}, z_val)
+        ).T  # (n_fluxes, n_val)
+        # Constant per-flux variance, as exported.
+        val_vars = np.broadcast_to(
+            np.asarray(mean_var)[:, None], val_means.shape
+        )
+        student_val = np.stack([val_means, val_vars], axis=-1)
+    else:
+        student_val = np.asarray(
+            jax.vmap(
+                lambda p: student_network.apply(
+                    {"params": p}, z_val, deterministic=True
+                )
+            )(student_params)
+        )
     out_stds = np.array(
         [teacher_dict["stats"][label]["std"] for label in output_labels]
     )
@@ -454,24 +547,59 @@ def main():
                 np.sqrt(np.mean((teacher_mean[near] - student_mean[near]) ** 2))
                 * out_stds[i]
             ),
-            "logvar_r2": r2(
-                np.log(y_val[i, :, 1] + eps), np.log(student_val[i, :, 1] + eps)
-            ),
         }
+        if not args.shared_trunk:
+            metrics[label]["logvar_r2"] = r2(
+                np.log(y_val[i, :, 1] + eps), np.log(student_val[i, :, 1] + eps)
+            )
         print(f"{label}: {metrics[label]}")
 
     # --- Package in the released pickle schema ----------------------------
     student_pickle_params = {}
-    for i, label in enumerate(output_labels):
-        per_flux = jax.tree.map(lambda leaf: leaf[i], student_params)
-        layers = {}
-        for j in range(args.num_hiddens):
-            dense = per_flux["GaussianMLP_0"][f"Dense_{j}"]
-            layers[f"FullyConnectedLayer_{j}"] = {
-                "weight": np.asarray(dense["kernel"]).T.astype(np.float32),
-                "bias": np.asarray(dense["bias"]).T.astype(np.float32),
+    if args.shared_trunk:
+        # Export per flux as trunk + head, with the head padded to the
+        # 2-unit [mean, variance] output layer GaussianMLP expects: the
+        # variance column has zero weights and a bias of
+        # softplus^-1(teacher mean variance), so the loaded network emits
+        # the trained mean and a constant per-flux variance. The trunk
+        # weights are duplicated across fluxes, trading file size for
+        # loading through the released inference path unchanged.
+        mean_var_np = np.maximum(np.asarray(mean_var), eps)
+        for i, label in enumerate(output_labels):
+            layers = {}
+            for j in range(args.num_hiddens - 1):
+                dense = student_params[f"Trunk_{j}"]
+                layers[f"FullyConnectedLayer_{j}"] = {
+                    "weight": np.asarray(dense["kernel"]).T.astype(np.float32),
+                    "bias": np.asarray(dense["bias"]).T.astype(np.float32),
+                }
+            head = student_params[f"Head_{i}"]
+            head_kernel = np.asarray(head["kernel"])  # (hidden, 1)
+            out_weight = np.zeros((2, head_kernel.shape[0]), dtype=np.float32)
+            out_weight[0] = head_kernel[:, 0]
+            out_bias = np.array(
+                [
+                    float(np.asarray(head["bias"])[0]),
+                    float(np.log(np.expm1(mean_var_np[i]))),
+                ],
+                dtype=np.float32,
+            )
+            layers[f"FullyConnectedLayer_{args.num_hiddens - 1}"] = {
+                "weight": out_weight,
+                "bias": out_bias,
             }
-        student_pickle_params[label] = {"MLP_0": layers}
+            student_pickle_params[label] = {"MLP_0": layers}
+    else:
+        for i, label in enumerate(output_labels):
+            per_flux = jax.tree.map(lambda leaf: leaf[i], student_params)
+            layers = {}
+            for j in range(args.num_hiddens):
+                dense = per_flux["GaussianMLP_0"][f"Dense_{j}"]
+                layers[f"FullyConnectedLayer_{j}"] = {
+                    "weight": np.asarray(dense["kernel"]).T.astype(np.float32),
+                    "bias": np.asarray(dense["bias"]).T.astype(np.float32),
+                }
+            student_pickle_params[label] = {"MLP_0": layers}
 
     student_config = dict(teacher_dict["config"])
     student_config.update(
@@ -481,9 +609,16 @@ def main():
         dropout=0.0,
         activation=args.activation,
         regressor_type="DistilledStudent",
-        loss_function="distillation(MSE mean + MSE logvar)",
+        loss_function=(
+            "distillation(MSE mean; shared trunk; constant variance)"
+            if args.shared_trunk
+            else "distillation(MSE mean + MSE logvar)"
+        ),
         distillation={
             "teacher": args.machine,
+            "shared_trunk": args.shared_trunk,
+            "mean_only": args.shared_trunk,
+            "sign_loss_weight": args.sign_loss_weight,
             "teacher_config": {
                 "num_estimators": teacher_network.n_ensemble,
                 "model_size": teacher_network.num_hiddens,
