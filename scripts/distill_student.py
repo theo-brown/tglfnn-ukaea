@@ -192,7 +192,14 @@ def main():
                         help="Margin for --oob-fraction sampling, as a "
                         "fraction of each dimension's range added to both "
                         "sides of the box.")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Seed for data sampling (pool and validation "
+                        "sets are identical across runs with the same seed).")
+    parser.add_argument("--init-seed", type=int, default=None,
+                        help="Seed for network initialisation and minibatch "
+                        "draws (defaults to --seed). Varying it with a fixed "
+                        "--seed isolates optimisation variance from data "
+                        "variance.")
     parser.add_argument("--output", default=None,
                         help="Output pickle path (default: "
                         "tglfnn_ukaea/weights/<machine>_student.pkl)")
@@ -234,7 +241,8 @@ def main():
         dropout=0.0,
         activation=args.activation,
     )
-    init_keys = jax.random.split(jax.random.key(args.seed), n_fluxes)
+    init_seed = args.init_seed if args.init_seed is not None else args.seed
+    init_keys = jax.random.split(jax.random.key(init_seed), n_fluxes)
     dummy = jnp.zeros((1, n_inputs))
     student_params = jax.tree.map(
         lambda *args_: jnp.stack(args_),
@@ -303,7 +311,7 @@ def main():
 
     # --- Training loop ----------------------------------------------------
     t0 = time.time()
-    key = jax.random.key(args.seed + 1)
+    key = jax.random.key(init_seed + 1)
     for step in range(args.steps):
         key, subkey = jax.random.split(key)
         student_params, opt_state, loss, aux = train_step(
