@@ -54,6 +54,13 @@ class ActiveLearningConfig:
     # warm_start.
     n_replay: int = 1024
     replay_weight: float = 1.0
+    # If positive, each round's replay weight is replay_weight scaled by
+    # max(1, replay_anchor_size / n_data). The teacher stands in for its
+    # (much larger) training set, so while the labelled set is small the
+    # anchor dominates — suppressing the early fine-tuning shock that
+    # otherwise degrades the model globally — and the multiplier decays
+    # to 1 once n_data reaches the anchor size. 0 disables.
+    replay_anchor_size: int = 0
     # Scale (gyro-Bohm units) of the asinh loss weighting: samples are
     # weighted by 1 / (1 + (flux / s)^2), the squared Jacobian of
     # asinh(flux / s). This fits the model in asinh space to first order, so
@@ -387,6 +394,11 @@ def run_active_learning(
                 )
                 x_replay = jnp.concatenate([x_replay, pool[pool_idx]])
             x_replay_norm = normalizer.normalize_inputs(x_replay)
+        round_replay_weight = config.replay_weight
+        if use_replay and config.replay_anchor_size > 0:
+            round_replay_weight *= max(
+                1.0, config.replay_anchor_size / len(x_data)
+            )
         train_losses = {}
         for i, label in enumerate(output_labels):
             y_train_norm = normalizer.normalize_output(
@@ -428,7 +440,7 @@ def run_active_learning(
                 dropout_rate=config.dropout,
                 sample_weights=sample_weights,
                 replay=replay,
-                replay_weight=config.replay_weight,
+                replay_weight=round_replay_weight,
                 replay_sample_weights=replay_sample_weights,
             )
 
@@ -439,6 +451,7 @@ def run_active_learning(
             "n_new": len(x_new),
             "seconds_oracle": oracle_seconds,
             "seconds_round": time.monotonic() - round_start,
+            "replay_weight": round_replay_weight,
             **{f"train_nll_{k}": v for k, v in train_losses.items()},
         }
         if n_val > 0:
