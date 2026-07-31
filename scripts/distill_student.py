@@ -223,6 +223,19 @@ def main():
                         choices=["relu", "tanh", "sigmoid"],
                         help="tanh gives a smooth surrogate, which helps "
                         "Newton-type transport solvers converge.")
+    parser.add_argument("--mean-loss", default="mse",
+                        choices=["mse", "huber", "mae"],
+                        help="Regression loss for the mean-matching term "
+                        "(shared-trunk mode only). 'huber' is quadratic "
+                        "inside --huber-delta-gb and linear outside (tail-"
+                        "robust, smooth convergence); 'mae' applies "
+                        "constant-magnitude gradients, pressing hardest on "
+                        "already-small residuals at the cost of a higher "
+                        "noise floor (pair with a deep anneal). Composes "
+                        "with the per-sample --loss-weight-q0 weighting.")
+    parser.add_argument("--huber-delta-gb", type=float, default=30.0,
+                        help="Huber transition scale in GB units, applied "
+                        "per flux in normalized space (delta / output std).")
     parser.add_argument("--head-hiddens", type=int, default=0,
                         help="Shared-trunk mode only: number of per-flux "
                         "hidden layers in each head branch. Moves capacity "
@@ -588,16 +601,29 @@ def main():
         return jnp.mean(jax.nn.relu(-q_pred * q_true)) / sign_scale**2
 
     if args.shared_trunk:
+        # Per-flux Huber scale in normalized space.
+        huber_delta = args.huber_delta_gb / out_stds_dev
+
+        def _mean_err(resid):
+            if args.mean_loss == "mse":
+                return resid**2
+            if args.mean_loss == "mae":
+                return jnp.abs(resid)
+            d = huber_delta[:, None]
+            a = jnp.abs(resid)
+            return jnp.where(a <= d, 0.5 * resid**2, d * (a - 0.5 * d))
 
         def loss_fn(params, z, y, w):
             # (batch, n_fluxes) -> (n_fluxes, batch), matching y/w layout.
             pred_mean = student_network.apply({"params": params}, z).T
-            mean_loss = jnp.mean(w * (pred_mean - y[..., 0]) ** 2)
+            mean_loss = jnp.mean(w * _mean_err(pred_mean - y[..., 0]))
             sign_loss = _sign_hinge(pred_mean, y[..., 0])
             total = mean_loss + args.sign_loss_weight * sign_loss
             return total, (mean_loss, jnp.zeros(()), sign_loss)
 
     else:
+        if args.mean_loss != "mse":
+            raise SystemExit("--mean-loss requires --shared-trunk")
 
         def loss_fn(params, z, y, w):
             pred = jax.vmap(
@@ -808,6 +834,8 @@ def main():
             "resample_every": args.resample_every,
             "init_from": args.init_from,
             "head_hiddens": args.head_hiddens,
+            "mean_loss": args.mean_loss,
+            "huber_delta_gb": args.huber_delta_gb,
             "weight_decay": args.weight_decay,
             "var_loss_weight": args.var_loss_weight,
             "loss_weight_q0": args.loss_weight_q0,
