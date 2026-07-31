@@ -292,6 +292,29 @@ def main():
                         "student never sees the same sample twice across "
                         "pool generations. The validation set is fixed. "
                         "0 keeps a single fixed pool.")
+    parser.add_argument("--ema-decay", type=float, default=0.0,
+                        help="If > 0 (e.g. 0.999), maintain an exponential "
+                        "moving average of the student weights and export "
+                        "it as the checkpoint; the final raw weights are "
+                        "exported alongside with a _raw suffix.")
+    parser.add_argument("--sobolev-weight", type=float, default=0.0,
+                        help="If > 0, adds a Sobolev term matching teacher "
+                        "directional derivatives: per step, random unit "
+                        "directions are drawn and the MAE between student "
+                        "and teacher directional derivatives (from "
+                        "precomputed teacher Jacobians) is penalized. "
+                        "Shared-trunk only.")
+    parser.add_argument("--sobolev-dirs", type=int, default=2,
+                        help="Random directions per step for the Sobolev "
+                        "term.")
+    parser.add_argument("--boundary-fraction", type=float, default=0.0,
+                        help="Fraction of the training pool rejection-"
+                        "sampled from the near-threshold shell: uniform "
+                        "in-box draws kept only if any flux satisfies "
+                        "|flux_GB| < --boundary-qgb.")
+    parser.add_argument("--boundary-qgb", type=float, default=10.0,
+                        help="Shell half-width in GB for "
+                        "--boundary-fraction sampling.")
     parser.add_argument("--weight-decay", type=float, default=1e-5,
                         help="AdamW weight decay. Distillation targets are "
                         "noiseless, so 0 is a reasonable choice.")
@@ -387,46 +410,125 @@ def main():
         print(f"Student: 1x{args.hidden_size}-wide x {args.num_hiddens}-layer "
               f"({args.activation}) per flux")
 
+    out_stds_np = np.array(
+        [teacher_dict["stats"][label]["std"] for label in output_labels]
+    )
+    out_means_np = np.array(
+        [teacher_dict["stats"][label]["mean"] for label in output_labels]
+    )
+
+    def teacher_jacobians(z, batch_size=8192):
+        """Teacher Jacobian d(normalized mean)/dz per flux: (n, n_fluxes, 13).
+
+        Costs n_fluxes VJPs per point (~4x the labelling cost); consumed by
+        the Sobolev term as directional-derivative labels.
+        """
+
+        def flux_means(z_single):
+            out = jax.vmap(
+                lambda p: teacher_network.apply(
+                    {"params": p}, z_single[None, :], deterministic=True
+                )
+            )(teacher_params)
+            return out[:, 0, 0]
+
+        jac_fn = jax.jit(jax.vmap(jax.jacrev(flux_means)))
+        chunks = []
+        tj = time.time()
+        for start in range(0, z.shape[0], batch_size):
+            chunks.append(
+                np.asarray(jac_fn(z[start : start + batch_size])).astype(
+                    np.float32
+                )
+            )
+            if start == 0:
+                rate = batch_size / max(time.time() - tj, 1e-9)
+                print(f"Jacobian labelling at ~{rate:.0f} samples/s "
+                      f"(first batch incl. compile); "
+                      f"{z.shape[0] / rate / 60:.0f} min estimated")
+        return np.concatenate(chunks)
+
     # --- Distillation data ------------------------------------------------
     rng = np.random.default_rng(args.seed)
     t0 = time.time()
     n_oob = int(args.n_train * args.oob_fraction)
+    n_boundary = int(args.n_train * args.boundary_fraction)
+
+    def sample_boundary(pool_rng, n_target):
+        """Rejection-samples uniform in-box points with any |flux| in the
+        near-threshold shell."""
+        kept, got = [], 0
+        while got < n_target:
+            xc = sample_inputs(teacher_dict, 1_000_000, pool_rng)
+            zc = (jnp.asarray(xc) - in_means) / in_stds
+            yc = teacher_labels(teacher_network, teacher_params, zc)
+            flux_gb = np.abs(
+                yc[..., 0] * out_stds_np[:, None] + out_means_np[:, None]
+            )
+            mask = np.any(flux_gb < args.boundary_qgb, axis=0)
+            kept.append(xc[mask])
+            got += int(mask.sum())
+            print(f"  boundary sampling: {got}/{n_target} "
+                  f"(acceptance {100 * mask.mean():.1f}%)")
+        return np.concatenate(kept)[:n_target]
 
     def make_pool(pool_rng):
         """Samples and teacher-labels a fresh training pool."""
-        x = np.concatenate([
-            sample_inputs(teacher_dict, args.n_train - n_oob, pool_rng),
+        parts = [
+            sample_inputs(
+                teacher_dict, args.n_train - n_oob - n_boundary, pool_rng
+            ),
             sample_inputs(
                 teacher_dict, n_oob, pool_rng, margin=args.oob_margin
             ),
-        ])
+        ]
+        if n_boundary > 0:
+            parts.append(sample_boundary(pool_rng, n_boundary))
+        x = np.concatenate(parts)
         z = (jnp.asarray(x) - in_means) / in_stds
         y = teacher_labels(teacher_network, teacher_params, z)
         return z, jnp.asarray(y)
 
+    need_jac = args.sobolev_weight > 0
+    j_train_dev = None
     if args.pool_cache and pathlib.Path(args.pool_cache).exists():
-        cached = np.load(args.pool_cache)
+        cached = dict(np.load(args.pool_cache))
         z_train_dev = jnp.asarray(cached["z_train"])
         y_train_dev = jnp.asarray(cached["y_train"])
         z_val = jnp.asarray(cached["z_val"])
         y_val = cached["y_val"]
         print(f"Loaded pool cache from {args.pool_cache} in "
               f"{time.time() - t0:.1f}s")
+        if need_jac:
+            if "j_train" in cached:
+                j_train_dev = jnp.asarray(cached["j_train"])
+            else:
+                print("Cache lacks Jacobians; computing and re-saving...")
+                j_np = teacher_jacobians(z_train_dev)
+                cached["j_train"] = j_np
+                np.savez(args.pool_cache, **cached)
+                j_train_dev = jnp.asarray(j_np)
     else:
-        z_train_dev, y_train_dev = make_pool(rng)
+        # Validation set FIRST so it is identical across pool compositions
+        # (boundary sampling consumes an unpredictable amount of the rng
+        # stream).
         x_val = sample_inputs(teacher_dict, args.n_val, rng)
         z_val = (jnp.asarray(x_val) - in_means) / in_stds
         y_val = teacher_labels(teacher_network, teacher_params, z_val)
+        z_train_dev, y_train_dev = make_pool(rng)
         print(f"Labelled {args.n_train}+{args.n_val} samples with the "
               f"teacher in {time.time() - t0:.1f}s")
+        save = {
+            "z_train": np.asarray(z_train_dev),
+            "y_train": np.asarray(y_train_dev),
+            "z_val": np.asarray(z_val),
+            "y_val": np.asarray(y_val),
+        }
+        if need_jac:
+            save["j_train"] = teacher_jacobians(z_train_dev)
+            j_train_dev = jnp.asarray(save["j_train"])
         if args.pool_cache:
-            np.savez(
-                args.pool_cache,
-                z_train=np.asarray(z_train_dev),
-                y_train=np.asarray(y_train_dev),
-                z_val=np.asarray(z_val),
-                y_val=np.asarray(y_val),
-            )
+            np.savez(args.pool_cache, **save)
             print(f"Saved pool cache to {args.pool_cache}")
 
     # --- Student setup ----------------------------------------------------
@@ -613,19 +715,46 @@ def main():
             a = jnp.abs(resid)
             return jnp.where(a <= d, 0.5 * resid**2, d * (a - 0.5 * d))
 
-        def loss_fn(params, z, y, w):
+        def loss_fn(params, z, y, w, j, dirs):
             # (batch, n_fluxes) -> (n_fluxes, batch), matching y/w layout.
             pred_mean = student_network.apply({"params": params}, z).T
             mean_loss = jnp.mean(w * _mean_err(pred_mean - y[..., 0]))
             sign_loss = _sign_hinge(pred_mean, y[..., 0])
-            total = mean_loss + args.sign_loss_weight * sign_loss
-            return total, (mean_loss, jnp.zeros(()), sign_loss)
+            sob_loss = jnp.zeros(())
+            if args.sobolev_weight > 0:
+                # Stochastic Sobolev: match teacher directional derivatives
+                # along random unit directions. Teacher side is a contraction
+                # of the precomputed Jacobian; student side is one JVP per
+                # direction.
+                def apply_T(zz):
+                    return student_network.apply({"params": params}, zz).T
+
+                for d in range(args.sobolev_dirs):
+                    v = dirs[d]
+                    _, dd_student = jax.jvp(
+                        apply_T, (z,), (jnp.broadcast_to(v, z.shape),)
+                    )
+                    dd_teacher = jnp.einsum("bfi,i->fb", j, v)
+                    sob_loss = sob_loss + jnp.mean(
+                        w * jnp.abs(dd_student - dd_teacher)
+                    )
+                sob_loss = sob_loss / args.sobolev_dirs
+            total = (
+                mean_loss
+                + args.sign_loss_weight * sign_loss
+                + args.sobolev_weight * sob_loss
+            )
+            return total, (mean_loss, sob_loss, sign_loss)
 
     else:
         if args.mean_loss != "mse":
             raise SystemExit("--mean-loss requires --shared-trunk")
 
-        def loss_fn(params, z, y, w):
+        if args.sobolev_weight > 0:
+            raise SystemExit("--sobolev-weight requires --shared-trunk")
+
+        def loss_fn(params, z, y, w, j, dirs):
+            del j, dirs
             pred = jax.vmap(
                 lambda p: student_network.apply(
                     {"params": p}, z, deterministic=True
@@ -644,18 +773,42 @@ def main():
             )
             return total, (mean_loss, logvar_loss, sign_loss)
 
+    use_sobolev = args.sobolev_weight > 0
+
     @jax.jit
-    def train_step(params, opt_state, key, z_pool, y_pool, w_pool, cdf):
-        uniforms = jax.random.uniform(key, (args.batch_size,))
+    def train_step(
+        params, ema, opt_state, key, z_pool, y_pool, w_pool, cdf, j_pool
+    ):
+        key_idx, key_dirs = jax.random.split(key)
+        uniforms = jax.random.uniform(key_idx, (args.batch_size,))
         idx = jnp.searchsorted(cdf, uniforms)
+        if use_sobolev:
+            j_batch = j_pool[idx]
+            dirs = jax.random.normal(key_dirs, (args.sobolev_dirs, 13))
+            dirs = dirs / jnp.linalg.norm(dirs, axis=1, keepdims=True)
+        else:
+            j_batch, dirs = None, None
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            params, z_pool[idx], y_pool[:, idx], w_pool[:, idx]
+            params, z_pool[idx], y_pool[:, idx], w_pool[:, idx],
+            j_batch, dirs,
         )
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
-        return params, opt_state, loss, aux
+        if args.ema_decay > 0:
+            ema = jax.tree.map(
+                lambda e, p: args.ema_decay * e + (1 - args.ema_decay) * p,
+                ema, params,
+            )
+        return params, ema, opt_state, loss, aux
 
     # --- Training loop ----------------------------------------------------
+    if args.resample_every > 0 and use_sobolev:
+        raise SystemExit(
+            "--resample-every with --sobolev-weight is not supported "
+            "(Jacobian labels would go stale)"
+        )
+    aux1_name = "sob" if args.shared_trunk else "logvar"
+    ema_params = student_params if args.ema_decay > 0 else None
     t0 = time.time()
     key = jax.random.key(init_seed + 1)
     for step in range(args.steps):
@@ -676,42 +829,78 @@ def main():
             print(f"step {step:5d} resampled pool (generation {generation}, "
                   f"{time.time() - tr:.1f}s)")
         key, subkey = jax.random.split(key)
-        student_params, opt_state, loss, aux = train_step(
-            student_params, opt_state, subkey,
+        student_params, ema_params, opt_state, loss, aux = train_step(
+            student_params, ema_params, opt_state, subkey,
             z_train_dev, y_train_dev, loss_weights, sampling_cdf,
+            j_train_dev,
         )
         if step % 200 == 0 or step == args.steps - 1:
             print(f"step {step:5d} loss={float(loss):.5f} "
-                  f"mean={float(aux[0]):.5f} logvar={float(aux[1]):.5f} "
+                  f"mean={float(aux[0]):.5f} {aux1_name}={float(aux[1]):.5f} "
                   f"sign={float(aux[2]):.5f} "
                   f"({time.time() - t0:.0f}s)")
 
     # --- Validation against the teacher ----------------------------------
+    # Jacobian validation subset (shared across param sets): teacher
+    # Jacobians on 20k val points, compared against student Jacobians.
+    n_jval = min(20_000, z_val.shape[0])
+    j_val_teacher = None
     if args.shared_trunk:
-        val_means = np.asarray(
-            student_network.apply({"params": student_params}, z_val)
-        ).T  # (n_fluxes, n_val)
-        # Constant per-flux variance, as exported.
-        val_vars = np.broadcast_to(
-            np.asarray(mean_var)[:, None], val_means.shape
-        )
-        student_val = np.stack([val_means, val_vars], axis=-1)
-    else:
-        student_val = np.asarray(
-            jax.vmap(
-                lambda p: student_network.apply(
-                    {"params": p}, z_val, deterministic=True
+        j_val_teacher = teacher_jacobians(z_val[:n_jval])
+
+    def compute_metrics(params):
+        if args.shared_trunk:
+            val_means = np.asarray(
+                student_network.apply({"params": params}, z_val)
+            ).T  # (n_fluxes, n_val)
+            # Constant per-flux variance, as exported.
+            val_vars = np.broadcast_to(
+                np.asarray(mean_var)[:, None], val_means.shape
+            )
+            student_val = np.stack([val_means, val_vars], axis=-1)
+        else:
+            student_val = np.asarray(
+                jax.vmap(
+                    lambda p: student_network.apply(
+                        {"params": p}, z_val, deterministic=True
+                    )
+                )(params)
+            )
+        metrics = _pointwise_metrics(student_val)
+        if args.shared_trunk:
+            s_jac = np.asarray(
+                jax.vmap(
+                    jax.jacrev(
+                        lambda zz: student_network.apply(
+                            {"params": params}, zz[None, :]
+                        )[0]
+                    )
+                )(z_val[:n_jval])
+            )  # (n_jval, n_fluxes, 13)
+            dj = np.abs(s_jac - j_val_teacher)
+            drive = [
+                list(teacher_dict["input_labels"]).index(k)
+                for k in ("RLNS_1", "RLTS_1", "RLTS_2")
+            ]
+            for i, label in enumerate(output_labels):
+                metrics[label]["jac_mae_norm"] = float(np.mean(dj[:, i, :]))
+                metrics[label]["jac_mae_drive_norm"] = float(
+                    np.mean(dj[:, i, drive])
                 )
-            )(student_params)
-        )
-    out_stds = np.array(
-        [teacher_dict["stats"][label]["std"] for label in output_labels]
-    )
-    out_means = np.array(
-        [teacher_dict["stats"][label]["mean"] for label in output_labels]
-    )
-    metrics = {}
-    for i, label in enumerate(output_labels):
+        for label in output_labels:
+            print(f"{label}: {metrics[label]}")
+        return metrics
+
+    out_stds = out_stds_np
+    out_means = out_means_np
+
+    def _pointwise_metrics(student_val):
+        metrics = {}
+        for i, label in enumerate(output_labels):
+            metrics[label] = _one_flux_metrics(i, label, student_val)
+        return metrics
+
+    def _one_flux_metrics(i, label, student_val):
         teacher_mean, student_mean = y_val[i, :, 0], student_val[i, :, 0]
         # Near-threshold subset: |flux| < 10 GB. R^2 is affine-invariant, so
         # normalized-space R^2 equals physical-space R^2; RMSE is scaled back
@@ -723,7 +912,7 @@ def main():
         teacher_phys = teacher_mean * out_stds[i] + out_means[i]
         student_phys = student_mean * out_stds[i] + out_means[i]
         band = np.abs(teacher_phys) < 20.0
-        metrics[label] = {
+        result = {
             "sign_agreement_lt20gb": float(
                 np.mean(
                     np.sign(student_phys[band]) == np.sign(teacher_phys[band])
@@ -740,64 +929,74 @@ def main():
             ),
         }
         if not args.shared_trunk:
-            metrics[label]["logvar_r2"] = r2(
+            result["logvar_r2"] = r2(
                 np.log(y_val[i, :, 1] + eps), np.log(student_val[i, :, 1] + eps)
             )
-        print(f"{label}: {metrics[label]}")
+        return result
 
     # --- Package in the released pickle schema ----------------------------
-    student_pickle_params = {}
-    if args.shared_trunk:
-        # Export per flux as trunk + head, with the head padded to the
-        # 2-unit [mean, variance] output layer GaussianMLP expects: the
-        # variance column has zero weights and a bias of
-        # softplus^-1(teacher mean variance), so the loaded network emits
-        # the trained mean and a constant per-flux variance. The trunk
-        # weights are duplicated across fluxes, trading file size for
-        # loading through the released inference path unchanged.
-        mean_var_np = np.maximum(np.asarray(mean_var), eps)
-        n_trunk_out = args.num_hiddens - 1 - args.head_hiddens
-        for i, label in enumerate(output_labels):
-            layers = {}
-            for j in range(n_trunk_out):
-                dense = student_params[f"Trunk_{j}"]
-                layers[f"FullyConnectedLayer_{j}"] = {
-                    "weight": np.asarray(dense["kernel"]).T.astype(np.float32),
-                    "bias": np.asarray(dense["bias"]).T.astype(np.float32),
+    def package_params(export_params):
+        pickle_params = {}
+        if args.shared_trunk:
+            # Export per flux as trunk + head, with the head padded to the
+            # 2-unit [mean, variance] output layer GaussianMLP expects: the
+            # variance column has zero weights and a bias of
+            # softplus^-1(teacher mean variance), so the loaded network emits
+            # the trained mean and a constant per-flux variance. The trunk
+            # weights are duplicated across fluxes, trading file size for
+            # loading through the released inference path unchanged.
+            mean_var_np = np.maximum(np.asarray(mean_var), eps)
+            n_trunk_out = args.num_hiddens - 1 - args.head_hiddens
+            for i, label in enumerate(output_labels):
+                layers = {}
+                for j in range(n_trunk_out):
+                    dense = export_params[f"Trunk_{j}"]
+                    layers[f"FullyConnectedLayer_{j}"] = {
+                        "weight": np.asarray(dense["kernel"]).T.astype(
+                            np.float32
+                        ),
+                        "bias": np.asarray(dense["bias"]).T.astype(np.float32),
+                    }
+                for k in range(args.head_hiddens):
+                    dense = export_params[f"Head_{i}_Hidden_{k}"]
+                    layers[f"FullyConnectedLayer_{n_trunk_out + k}"] = {
+                        "weight": np.asarray(dense["kernel"]).T.astype(
+                            np.float32
+                        ),
+                        "bias": np.asarray(dense["bias"]).T.astype(np.float32),
+                    }
+                head = export_params[f"Head_{i}"]
+                head_kernel = np.asarray(head["kernel"])  # (hidden, 1)
+                out_weight = np.zeros(
+                    (2, head_kernel.shape[0]), dtype=np.float32
+                )
+                out_weight[0] = head_kernel[:, 0]
+                out_bias = np.array(
+                    [
+                        float(np.asarray(head["bias"])[0]),
+                        float(np.log(np.expm1(mean_var_np[i]))),
+                    ],
+                    dtype=np.float32,
+                )
+                layers[f"FullyConnectedLayer_{args.num_hiddens - 1}"] = {
+                    "weight": out_weight,
+                    "bias": out_bias,
                 }
-            for k in range(args.head_hiddens):
-                dense = student_params[f"Head_{i}_Hidden_{k}"]
-                layers[f"FullyConnectedLayer_{n_trunk_out + k}"] = {
-                    "weight": np.asarray(dense["kernel"]).T.astype(np.float32),
-                    "bias": np.asarray(dense["bias"]).T.astype(np.float32),
-                }
-            head = student_params[f"Head_{i}"]
-            head_kernel = np.asarray(head["kernel"])  # (hidden, 1)
-            out_weight = np.zeros((2, head_kernel.shape[0]), dtype=np.float32)
-            out_weight[0] = head_kernel[:, 0]
-            out_bias = np.array(
-                [
-                    float(np.asarray(head["bias"])[0]),
-                    float(np.log(np.expm1(mean_var_np[i]))),
-                ],
-                dtype=np.float32,
-            )
-            layers[f"FullyConnectedLayer_{args.num_hiddens - 1}"] = {
-                "weight": out_weight,
-                "bias": out_bias,
-            }
-            student_pickle_params[label] = {"MLP_0": layers}
-    else:
-        for i, label in enumerate(output_labels):
-            per_flux = jax.tree.map(lambda leaf: leaf[i], student_params)
-            layers = {}
-            for j in range(args.num_hiddens):
-                dense = per_flux["GaussianMLP_0"][f"Dense_{j}"]
-                layers[f"FullyConnectedLayer_{j}"] = {
-                    "weight": np.asarray(dense["kernel"]).T.astype(np.float32),
-                    "bias": np.asarray(dense["bias"]).T.astype(np.float32),
-                }
-            student_pickle_params[label] = {"MLP_0": layers}
+                pickle_params[label] = {"MLP_0": layers}
+        else:
+            for i, label in enumerate(output_labels):
+                per_flux = jax.tree.map(lambda leaf: leaf[i], export_params)
+                layers = {}
+                for j in range(args.num_hiddens):
+                    dense = per_flux["GaussianMLP_0"][f"Dense_{j}"]
+                    layers[f"FullyConnectedLayer_{j}"] = {
+                        "weight": np.asarray(dense["kernel"]).T.astype(
+                            np.float32
+                        ),
+                        "bias": np.asarray(dense["bias"]).T.astype(np.float32),
+                    }
+                pickle_params[label] = {"MLP_0": layers}
+        return pickle_params
 
     student_config = dict(teacher_dict["config"])
     student_config.update(
@@ -845,15 +1044,32 @@ def main():
             "oob_fraction": args.oob_fraction,
             "oob_margin": args.oob_margin,
             "seed": args.seed,
-            "metrics": metrics,
+            "ema_decay": args.ema_decay,
+            "sobolev_weight": args.sobolev_weight,
+            "sobolev_dirs": args.sobolev_dirs,
+            "boundary_fraction": args.boundary_fraction,
+            "boundary_qgb": args.boundary_qgb,
         },
     )
-    student_dict = {
-        "stats": teacher_dict["stats"],
-        "config": student_config,
-        "input_labels": teacher_dict["input_labels"],
-        "params": student_pickle_params,
-    }
+
+    def export(export_params, path, ema_flag):
+        metrics = compute_metrics(export_params)
+        cfg = dict(student_config)
+        dist = dict(cfg["distillation"])
+        dist["metrics"] = metrics
+        dist["ema"] = ema_flag
+        cfg["distillation"] = dist
+        student_dict = {
+            "stats": teacher_dict["stats"],
+            "config": cfg,
+            "input_labels": teacher_dict["input_labels"],
+            "params": package_params(export_params),
+        }
+        with open(path, "wb") as f:
+            pickle.dump(student_dict, f)
+        print(f"Wrote student checkpoint to {path} "
+              f"({path.stat().st_size / 1e6:.1f} MB)")
+        return metrics
 
     output_path = (
         pathlib.Path(args.output)
@@ -862,10 +1078,13 @@ def main():
         / "weights"
         / f"{args.machine}_student.pkl"
     )
-    with open(output_path, "wb") as f:
-        pickle.dump(student_dict, f)
-    print(f"Wrote student checkpoint to {output_path} "
-          f"({output_path.stat().st_size / 1e6:.1f} MB)")
+    export_ema = args.ema_decay > 0
+    main_params = ema_params if export_ema else student_params
+    metrics = export(main_params, output_path, export_ema)
+    if export_ema:
+        raw_path = output_path.with_name(output_path.stem + "_raw.pkl")
+        print("--- raw (non-EMA) weights ---")
+        export(student_params, raw_path, False)
     print(json.dumps(metrics, indent=2))
 
 
