@@ -689,6 +689,7 @@ def main():
             n_heads=n_fluxes,
             head_hiddens=args.head_hiddens,
             dtype=jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32,
+            dropout=args.dropout,
         )
         student_params = student_network.init(
             jax.random.key(init_seed), dummy
