@@ -73,28 +73,39 @@ class SharedTrunkMeanStudent(nn.Module):
     n_heads: int
     head_hiddens: int = 0
     dtype: Any = jnp.float32
+    dropout: float = 0.0
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, deterministic: bool = True):
         act = _ACTIVATIONS[self.activation]
         x = x.astype(self.dtype)
         n_trunk = self.num_hiddens - 1 - self.head_hiddens
+
+        def maybe_drop(h):
+            if self.dropout <= 0.0:
+                return h
+            return nn.Dropout(rate=self.dropout, deterministic=deterministic)(h)
+
         for j in range(n_trunk):
             x = act(
-                nn.Dense(
-                    self.hidden_size, name=f"Trunk_{j}", dtype=self.dtype
-                )(x)
+                maybe_drop(
+                    nn.Dense(
+                        self.hidden_size, name=f"Trunk_{j}", dtype=self.dtype
+                    )(x)
+                )
             )
         heads = []
         for i in range(self.n_heads):
             h = x
             for k in range(self.head_hiddens):
                 h = act(
-                    nn.Dense(
-                        self.hidden_size,
-                        name=f"Head_{i}_Hidden_{k}",
-                        dtype=self.dtype,
-                    )(h)
+                    maybe_drop(
+                        nn.Dense(
+                            self.hidden_size,
+                            name=f"Head_{i}_Hidden_{k}",
+                            dtype=self.dtype,
+                        )(h)
+                    )
                 )
             heads.append(nn.Dense(1, name=f"Head_{i}", dtype=self.dtype)(h))
         # Params stay float32 (Flax default param_dtype); only the compute
@@ -306,7 +317,51 @@ def main():
                         "Shared-trunk only.")
     parser.add_argument("--sobolev-dirs", type=int, default=2,
                         help="Random directions per step for the Sobolev "
-                        "term.")
+                        "term (ignored with --sobolev-exact).")
+    parser.add_argument("--sobolev-exact", action="store_true",
+                        help="Match the full student Jacobian against the "
+                        "cached teacher Jacobian instead of a random "
+                        "directional projection. With 3 outputs the exact "
+                        "Jacobian is 3 VJPs, so this removes the estimator "
+                        "noise at roughly 2x the Sobolev-term cost.")
+    parser.add_argument("--dropout", type=float, default=0.0,
+                        help="Dropout rate applied after each trunk/head "
+                        "hidden Dense layer during training. Inference is "
+                        "always deterministic, so the exported checkpoint "
+                        "records dropout=0 in its top-level config.")
+    parser.add_argument("--target-transform", default="linear",
+                        choices=["linear", "signed_log"],
+                        help="Space in which the mean-matching residual is "
+                        "measured. 'signed_log' applies "
+                        "sign(q)*log1p(|q|/q0) to both prediction and "
+                        "target in physical units, giving relative-error "
+                        "behaviour across the ~4 decades of flux while "
+                        "staying smooth through zero. The network still "
+                        "emits linear normalized flux, so the exported "
+                        "checkpoint loads through the released path "
+                        "unchanged.")
+    parser.add_argument("--target-log-q0", type=float, default=10.0,
+                        help="Scale (GB) of the signed-log transform.")
+    parser.add_argument("--mix-boxedge", type=float, default=0.0,
+                        help="Fraction of the pool drawn near the faces of "
+                        "the training hypercube: a random subset of "
+                        "dimensions is pushed into the outer "
+                        "--boxedge-band of its range.")
+    parser.add_argument("--boxedge-band", type=float, default=0.1,
+                        help="Width of the near-face band as a fraction of "
+                        "each dimension's range.")
+    parser.add_argument("--boxedge-dims", type=int, default=2,
+                        help="Max number of dimensions pushed to a face per "
+                        "box-edge sample (1..this, drawn uniformly).")
+    parser.add_argument("--mix-variance", type=float, default=0.0,
+                        help="Fraction of the pool drawn by importance "
+                        "sampling on the teacher's epistemic ensemble "
+                        "variance (variance across member means), the "
+                        "query-by-committee signal.")
+    parser.add_argument("--variance-candidates", type=int, default=6,
+                        help="Candidate oversampling factor for "
+                        "--mix-variance: this many candidates are labelled "
+                        "per accepted sample.")
     parser.add_argument("--boundary-fraction", type=float, default=0.0,
                         help="Fraction of the training pool rejection-"
                         "sampled from the near-threshold shell: uniform "
@@ -448,11 +503,94 @@ def main():
                       f"{z.shape[0] / rate / 60:.0f} min estimated")
         return np.concatenate(chunks)
 
+    def teacher_epistemic(z, batch_size=65536):
+        """Variance across ensemble-member means, per flux: (n_fluxes, n).
+
+        The ensemble's second output channel is aleatoric+epistemic; the
+        query-by-committee signal is the epistemic part alone, so the
+        members are evaluated individually here.
+        """
+        member = networks.GaussianMLP(
+            num_hiddens=teacher_network.num_hiddens,
+            hidden_size=teacher_network.hidden_size,
+            dropout=0.0,
+            activation=teacher_network.activation,
+        )
+
+        @jax.jit
+        def forward(x):
+            members = [
+                jax.vmap(
+                    lambda p: member.apply(
+                        {"params": p}, x, deterministic=True
+                    )[..., 0]
+                )(teacher_params[f"GaussianMLP_{i}"])
+                for i in range(teacher_network.n_ensemble)
+            ]
+            return jnp.var(jnp.stack(members), axis=0)  # (n_fluxes, batch)
+
+        out = [
+            np.asarray(forward(z[s : s + batch_size]))
+            for s in range(0, z.shape[0], batch_size)
+        ]
+        return np.concatenate(out, axis=1)
+
     # --- Distillation data ------------------------------------------------
     rng = np.random.default_rng(args.seed)
     t0 = time.time()
     n_oob = int(args.n_train * args.oob_fraction)
     n_boundary = int(args.n_train * args.boundary_fraction)
+    n_boxedge = int(args.n_train * args.mix_boxedge)
+    n_variance = int(args.n_train * args.mix_variance)
+
+    def sample_boxedge(pool_rng, n_target):
+        """Uniform samples with a few dimensions pushed against a box face.
+
+        Extrapolation risk is concentrated at the faces of the training
+        hypercube, and a solver line search reaches them; uniform sampling
+        puts almost no mass there in 13 dimensions.
+        """
+        x = sample_inputs(teacher_dict, n_target, pool_rng)
+        param_space = teacher_dict["config"]["param_space"]
+        n_dims = x.shape[1]
+        k = pool_rng.integers(1, args.boxedge_dims + 1, size=n_target)
+        for label_i, label in enumerate(teacher_dict["input_labels"]):
+            lo, hi = (float(b) for b in param_space[label][:2])
+            span = hi - lo
+            # Which rows push THIS dimension to a face.
+            hit = pool_rng.random(n_target) < (k / n_dims)
+            if not hit.any():
+                continue
+            u = pool_rng.random(hit.sum()) * args.boxedge_band
+            high_side = pool_rng.random(hit.sum()) < 0.5
+            edge = np.where(high_side, hi - u * span, lo + u * span)
+            if label in _LOG10_SAMPLED_INPUTS:
+                edge = 10.0**edge
+            x[hit, label_i] = edge.astype(np.float32)
+        return x
+
+    def sample_variance(pool_rng, n_target):
+        """Importance-samples on the teacher's epistemic ensemble variance."""
+        n_cand = n_target * args.variance_candidates
+        kept = []
+        got = 0
+        while got < n_target:
+            xc = sample_inputs(teacher_dict, min(n_cand, 2_000_000), pool_rng)
+            zc = (jnp.asarray(xc) - in_means) / in_stds
+            ep = teacher_epistemic(zc)  # (n_fluxes, n)
+            # Normalize per flux so no channel's scale dominates, then take
+            # the worst channel as the acquisition score.
+            score = np.max(ep / (np.mean(ep, axis=1, keepdims=True) + 1e-12),
+                           axis=0)
+            p = score / score.sum()
+            take = min(n_target - got, xc.shape[0])
+            idx = pool_rng.choice(xc.shape[0], size=take, replace=False, p=p)
+            kept.append(xc[idx])
+            got += take
+            print(f"  variance sampling: {got}/{n_target} "
+                  f"(score p90/p50 = "
+                  f"{np.percentile(score, 90) / np.median(score):.1f}x)")
+        return np.concatenate(kept)[:n_target]
 
     def sample_boundary(pool_rng, n_target):
         """Rejection-samples uniform in-box points with any |flux| in the
@@ -474,16 +612,23 @@ def main():
 
     def make_pool(pool_rng):
         """Samples and teacher-labels a fresh training pool."""
+        n_uniform = (
+            args.n_train - n_oob - n_boundary - n_boxedge - n_variance
+        )
+        if n_uniform < 0:
+            raise SystemExit("pool mix fractions exceed 1.0")
         parts = [
-            sample_inputs(
-                teacher_dict, args.n_train - n_oob - n_boundary, pool_rng
-            ),
+            sample_inputs(teacher_dict, n_uniform, pool_rng),
             sample_inputs(
                 teacher_dict, n_oob, pool_rng, margin=args.oob_margin
             ),
         ]
         if n_boundary > 0:
             parts.append(sample_boundary(pool_rng, n_boundary))
+        if n_boxedge > 0:
+            parts.append(sample_boxedge(pool_rng, n_boxedge))
+        if n_variance > 0:
+            parts.append(sample_variance(pool_rng, n_variance))
         x = np.concatenate(parts)
         z = (jnp.asarray(x) - in_means) / in_stds
         y = teacher_labels(teacher_network, teacher_params, z)
@@ -715,30 +860,68 @@ def main():
             a = jnp.abs(resid)
             return jnp.where(a <= d, 0.5 * resid**2, d * (a - 0.5 * d))
 
-        def loss_fn(params, z, y, w, j, dirs):
+        def _to_physical(norm):
+            return norm * out_stds_dev[:, None] + out_means_dev[:, None]
+
+        def _signed_log(q):
+            # Smooth (C1) through zero: d/dq = 1/(q0 + |q|).
+            return jnp.sign(q) * jnp.log1p(jnp.abs(q) / args.target_log_q0)
+
+        def loss_fn(params, z, y, w, j, dirs, drop_key):
             # (batch, n_fluxes) -> (n_fluxes, batch), matching y/w layout.
-            pred_mean = student_network.apply({"params": params}, z).T
-            mean_loss = jnp.mean(w * _mean_err(pred_mean - y[..., 0]))
+            kwargs = {}
+            if args.dropout > 0:
+                kwargs = {
+                    "deterministic": False,
+                    "rngs": {"dropout": drop_key},
+                }
+            pred_mean = student_network.apply(
+                {"params": params}, z, **kwargs
+            ).T
+            if args.target_transform == "signed_log":
+                resid = _signed_log(_to_physical(pred_mean)) - _signed_log(
+                    _to_physical(y[..., 0])
+                )
+            else:
+                resid = pred_mean - y[..., 0]
+            mean_loss = jnp.mean(w * _mean_err(resid))
             sign_loss = _sign_hinge(pred_mean, y[..., 0])
             sob_loss = jnp.zeros(())
             if args.sobolev_weight > 0:
-                # Stochastic Sobolev: match teacher directional derivatives
-                # along random unit directions. Teacher side is a contraction
-                # of the precomputed Jacobian; student side is one JVP per
-                # direction.
-                def apply_T(zz):
-                    return student_network.apply({"params": params}, zz).T
+                # The Sobolev term always uses the deterministic network:
+                # it matches the teacher's deterministic Jacobian, so
+                # injecting dropout noise into it would be counterproductive.
+                if args.sobolev_exact:
+                    # Full student Jacobian: 3 VJPs per sample, no estimator
+                    # noise. j is (batch, n_fluxes, n_inputs).
+                    jac_student = jax.vmap(
+                        jax.jacrev(
+                            lambda s: student_network.apply(
+                                {"params": params}, s[None, :]
+                            )[0]
+                        )
+                    )(z)
+                    sob_loss = jnp.mean(
+                        w.T[:, :, None] * jnp.abs(jac_student - j)
+                    )
+                else:
+                    # Stochastic Sobolev: match teacher directional
+                    # derivatives along random unit directions. Teacher side
+                    # is a contraction of the precomputed Jacobian; student
+                    # side is one JVP per direction.
+                    def apply_T(zz):
+                        return student_network.apply({"params": params}, zz).T
 
-                for d in range(args.sobolev_dirs):
-                    v = dirs[d]
-                    _, dd_student = jax.jvp(
-                        apply_T, (z,), (jnp.broadcast_to(v, z.shape),)
-                    )
-                    dd_teacher = jnp.einsum("bfi,i->fb", j, v)
-                    sob_loss = sob_loss + jnp.mean(
-                        w * jnp.abs(dd_student - dd_teacher)
-                    )
-                sob_loss = sob_loss / args.sobolev_dirs
+                    for d in range(args.sobolev_dirs):
+                        v = dirs[d]
+                        _, dd_student = jax.jvp(
+                            apply_T, (z,), (jnp.broadcast_to(v, z.shape),)
+                        )
+                        dd_teacher = jnp.einsum("bfi,i->fb", j, v)
+                        sob_loss = sob_loss + jnp.mean(
+                            w * jnp.abs(dd_student - dd_teacher)
+                        )
+                    sob_loss = sob_loss / args.sobolev_dirs
             total = (
                 mean_loss
                 + args.sign_loss_weight * sign_loss
@@ -753,8 +936,8 @@ def main():
         if args.sobolev_weight > 0:
             raise SystemExit("--sobolev-weight requires --shared-trunk")
 
-        def loss_fn(params, z, y, w, j, dirs):
-            del j, dirs
+        def loss_fn(params, z, y, w, j, dirs, drop_key):
+            del j, dirs, drop_key
             pred = jax.vmap(
                 lambda p: student_network.apply(
                     {"params": p}, z, deterministic=True
@@ -779,7 +962,7 @@ def main():
     def train_step(
         params, ema, opt_state, key, z_pool, y_pool, w_pool, cdf, j_pool
     ):
-        key_idx, key_dirs = jax.random.split(key)
+        key_idx, key_dirs, key_drop = jax.random.split(key, 3)
         uniforms = jax.random.uniform(key_idx, (args.batch_size,))
         idx = jnp.searchsorted(cdf, uniforms)
         if use_sobolev:
@@ -790,7 +973,7 @@ def main():
             j_batch, dirs = None, None
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
             params, z_pool[idx], y_pool[:, idx], w_pool[:, idx],
-            j_batch, dirs,
+            j_batch, dirs, key_drop,
         )
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
@@ -1047,8 +1230,16 @@ def main():
             "ema_decay": args.ema_decay,
             "sobolev_weight": args.sobolev_weight,
             "sobolev_dirs": args.sobolev_dirs,
+            "sobolev_exact": args.sobolev_exact,
             "boundary_fraction": args.boundary_fraction,
             "boundary_qgb": args.boundary_qgb,
+            "train_dropout": args.dropout,
+            "target_transform": args.target_transform,
+            "target_log_q0": args.target_log_q0,
+            "mix_boxedge": args.mix_boxedge,
+            "boxedge_band": args.boxedge_band,
+            "boxedge_dims": args.boxedge_dims,
+            "mix_variance": args.mix_variance,
         },
     )
 
