@@ -342,6 +342,22 @@ def main():
                         "unchanged.")
     parser.add_argument("--target-log-q0", type=float, default=10.0,
                         help="Scale (GB) of the signed-log transform.")
+    parser.add_argument("--output-parameterization", default="direct",
+                        choices=["direct", "leading_ratio"],
+                        help="'leading_ratio' predicts one leading flux plus "
+                        "a dimensionless ratio per remaining channel and "
+                        "multiplies them (the QLKNN structure), so every "
+                        "channel shares the leading flux's critical "
+                        "gradient by construction and only one output "
+                        "carries the wide dynamic range.")
+    parser.add_argument("--leading-flux", default="efe_gb",
+                        help="Flux used as the leading channel under "
+                        "--output-parameterization leading_ratio.")
+    parser.add_argument("--ratio-reg", type=float, default=1e-4,
+                        help="L2 penalty on the ratio heads. The "
+                        "reconstruction loss leaves the ratio unconstrained "
+                        "wherever the leading flux vanishes; this keeps it "
+                        "bounded there instead of drifting.")
     parser.add_argument("--mix-boxedge", type=float, default=0.0,
                         help="Fraction of the pool drawn near the faces of "
                         "the training hypercube: a random subset of "
@@ -868,6 +884,40 @@ def main():
             # Smooth (C1) through zero: d/dq = 1/(q0 + |q|).
             return jnp.sign(q) * jnp.log1p(jnp.abs(q) / args.target_log_q0)
 
+        lead_idx = (
+            output_labels.index(args.leading_flux)
+            if args.output_parameterization == "leading_ratio"
+            else 0
+        )
+        use_ratio = args.output_parameterization == "leading_ratio"
+
+        def _predict_norm(params, z, **kwargs):
+            """Normalized per-flux predictions, (batch, n_fluxes).
+
+            Under 'leading_ratio' the raw heads are [leading flux in
+            normalized units] and [dimensionless ratios]; they are combined
+            into physical fluxes and renormalized so everything downstream
+            (loss, Sobolev, metrics) compares like-for-like against the
+            teacher.
+            """
+            raw = student_network.apply({"params": params}, z, **kwargs)
+            if not use_ratio:
+                return raw
+            lead_phys = (
+                raw[:, lead_idx] * out_stds_dev[lead_idx]
+                + out_means_dev[lead_idx]
+            )
+            cols = []
+            for i in range(n_fluxes):
+                if i == lead_idx:
+                    cols.append(raw[:, i])
+                else:
+                    phys = lead_phys * raw[:, i]
+                    cols.append(
+                        (phys - out_means_dev[i]) / out_stds_dev[i]
+                    )
+            return jnp.stack(cols, axis=-1)
+
         def loss_fn(params, z, y, w, j, dirs, drop_key):
             # (batch, n_fluxes) -> (n_fluxes, batch), matching y/w layout.
             kwargs = {}
@@ -876,9 +926,7 @@ def main():
                     "deterministic": False,
                     "rngs": {"dropout": drop_key},
                 }
-            pred_mean = student_network.apply(
-                {"params": params}, z, **kwargs
-            ).T
+            pred_mean = _predict_norm(params, z, **kwargs).T
             if args.target_transform == "signed_log":
                 resid = _signed_log(_to_physical(pred_mean)) - _signed_log(
                     _to_physical(y[..., 0])
@@ -900,10 +948,7 @@ def main():
                     # i-th Jacobian row at once. j is (batch, n_fluxes,
                     # n_inputs).
                     out, vjp_fn = jax.vjp(
-                        lambda zz: student_network.apply(
-                            {"params": params}, zz
-                        ),
-                        z,
+                        lambda zz: _predict_norm(params, zz), z
                     )
                     rows = []
                     for i in range(n_fluxes):
@@ -919,7 +964,7 @@ def main():
                     # is a contraction of the precomputed Jacobian; student
                     # side is one JVP per direction.
                     def apply_T(zz):
-                        return student_network.apply({"params": params}, zz).T
+                        return _predict_norm(params, zz).T
 
                     for d in range(args.sobolev_dirs):
                         v = dirs[d]
@@ -931,10 +976,20 @@ def main():
                             w * jnp.abs(dd_student - dd_teacher)
                         )
                     sob_loss = sob_loss / args.sobolev_dirs
+            ratio_pen = jnp.zeros(())
+            if use_ratio and args.ratio_reg > 0:
+                # Where the leading flux vanishes the reconstruction loss
+                # leaves the ratio free; keep it bounded there.
+                raw = student_network.apply({"params": params}, z)
+                keep = jnp.array(
+                    [i for i in range(n_fluxes) if i != lead_idx]
+                )
+                ratio_pen = jnp.mean(raw[:, keep] ** 2)
             total = (
                 mean_loss
                 + args.sign_loss_weight * sign_loss
                 + args.sobolev_weight * sob_loss
+                + args.ratio_reg * ratio_pen
             )
             return total, (mean_loss, sob_loss, sign_loss)
 
@@ -1043,7 +1098,7 @@ def main():
     def compute_metrics(params):
         if args.shared_trunk:
             val_means = np.asarray(
-                student_network.apply({"params": params}, z_val)
+                _predict_norm(params, z_val)
             ).T  # (n_fluxes, n_val)
             # Constant per-flux variance, as exported.
             val_vars = np.broadcast_to(
@@ -1063,9 +1118,7 @@ def main():
             s_jac = np.asarray(
                 jax.vmap(
                     jax.jacrev(
-                        lambda zz: student_network.apply(
-                            {"params": params}, zz[None, :]
-                        )[0]
+                        lambda zz: _predict_norm(params, zz[None, :])[0]
                     )
                 )(z_val[:n_jval])
             )  # (n_jval, n_fluxes, 13)
@@ -1249,6 +1302,9 @@ def main():
             "boxedge_band": args.boxedge_band,
             "boxedge_dims": args.boxedge_dims,
             "mix_variance": args.mix_variance,
+            "output_parameterization": args.output_parameterization,
+            "leading_flux": args.leading_flux,
+            "ratio_reg": args.ratio_reg,
         },
     )
 
@@ -1259,8 +1315,17 @@ def main():
         dist["metrics"] = metrics
         dist["ema"] = ema_flag
         cfg["distillation"] = dist
+        stats = dict(teacher_dict["stats"])
+        if use_ratio:
+            # The ratio heads emit dimensionless values; give those channels
+            # identity output stats so the released unnormalize step is a
+            # no-op and the consumer receives the raw ratio to multiply by
+            # the leading flux.
+            for i, label in enumerate(output_labels):
+                if i != lead_idx:
+                    stats[label] = {"mean": 0.0, "std": 1.0}
         student_dict = {
-            "stats": teacher_dict["stats"],
+            "stats": stats,
             "config": cfg,
             "input_labels": teacher_dict["input_labels"],
             "params": package_params(export_params),
