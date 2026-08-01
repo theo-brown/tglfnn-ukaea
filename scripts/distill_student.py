@@ -892,15 +892,23 @@ def main():
                 # it matches the teacher's deterministic Jacobian, so
                 # injecting dropout noise into it would be counterproductive.
                 if args.sobolev_exact:
-                    # Full student Jacobian: 3 VJPs per sample, no estimator
-                    # noise. j is (batch, n_fluxes, n_inputs).
-                    jac_student = jax.vmap(
-                        jax.jacrev(
-                            lambda s: student_network.apply(
-                                {"params": params}, s[None, :]
-                            )[0]
-                        )
-                    )(z)
+                    # Full student Jacobian for the whole batch in n_fluxes
+                    # VJPs. The network is elementwise in the batch, so
+                    # d(sum_b out[b,i])/dz[b',:] is nonzero only at b'=b:
+                    # one VJP seeded with e_i therefore yields every sample's
+                    # i-th Jacobian row at once. j is (batch, n_fluxes,
+                    # n_inputs).
+                    out, vjp_fn = jax.vjp(
+                        lambda zz: student_network.apply(
+                            {"params": params}, zz
+                        ),
+                        z,
+                    )
+                    rows = []
+                    for i in range(n_fluxes):
+                        seed = jnp.zeros_like(out).at[:, i].set(1.0)
+                        rows.append(vjp_fn(seed)[0])
+                    jac_student = jnp.stack(rows, axis=1)
                     sob_loss = jnp.mean(
                         w.T[:, :, None] * jnp.abs(jac_student - j)
                     )
