@@ -303,6 +303,13 @@ def main():
                         "student never sees the same sample twice across "
                         "pool generations. The validation set is fixed. "
                         "0 keeps a single fixed pool.")
+    parser.add_argument("--checkpoint-every", type=int, default=0,
+                        help="Save params/EMA/optimizer state every N "
+                        "steps so a preempted run resumes instead of "
+                        "restarting. Defaults to <output>.ckpt; the "
+                        "file is removed on successful completion.")
+    parser.add_argument("--checkpoint-path", default=None,
+                        help="Override the checkpoint location.")
     parser.add_argument("--ema-decay", type=float, default=0.0,
                         help="If > 0 (e.g. 0.999), maintain an exponential "
                         "moving average of the student weights and export "
@@ -1058,7 +1065,49 @@ def main():
     ema_params = student_params if args.ema_decay > 0 else None
     t0 = time.time()
     key = jax.random.key(init_seed + 1)
-    for step in range(args.steps):
+
+    # Periodic checkpointing. Long runs on a preemptible container otherwise
+    # lose everything on a restart; the optimizer state carries the schedule
+    # step count, so resuming reproduces the same LR trajectory.
+    ckpt_path = (
+        pathlib.Path(args.checkpoint_path)
+        if args.checkpoint_path
+        else pathlib.Path(str(args.output) + ".ckpt")
+        if args.output
+        else None
+    )
+    start_step = 0
+    if ckpt_path is not None and ckpt_path.exists():
+        with open(ckpt_path, "rb") as f:
+            saved = pickle.load(f)
+        to_dev = lambda t: jax.tree.map(jnp.asarray, t)
+        student_params = to_dev(saved["params"])
+        ema_params = to_dev(saved["ema"]) if saved["ema"] is not None else None
+        opt_state = to_dev(saved["opt_state"])
+        key = jax.random.wrap_key_data(jnp.asarray(saved["key"]))
+        start_step = saved["step"] + 1
+        print(f"Resumed from {ckpt_path} at step {start_step}")
+
+    def save_checkpoint(step):
+        if ckpt_path is None:
+            return
+        to_host = lambda t: jax.tree.map(np.asarray, t)
+        tmp = ckpt_path.with_suffix(ckpt_path.suffix + ".tmp")
+        with open(tmp, "wb") as f:
+            pickle.dump(
+                {
+                    "step": step,
+                    "params": to_host(student_params),
+                    "ema": to_host(ema_params) if ema_params is not None
+                    else None,
+                    "opt_state": to_host(opt_state),
+                    "key": np.asarray(jax.random.key_data(key)),
+                },
+                f,
+            )
+        tmp.replace(ckpt_path)  # atomic: never leave a torn checkpoint
+
+    for step in range(start_step, args.steps):
         if (
             args.resample_every > 0
             and step > 0
@@ -1086,6 +1135,12 @@ def main():
                   f"mean={float(aux[0]):.5f} {aux1_name}={float(aux[1]):.5f} "
                   f"sign={float(aux[2]):.5f} "
                   f"({time.time() - t0:.0f}s)")
+        if (
+            args.checkpoint_every > 0
+            and step > start_step
+            and step % args.checkpoint_every == 0
+        ):
+            save_checkpoint(step)
 
     # --- Validation against the teacher ----------------------------------
     # Jacobian validation subset (shared across param sets): teacher
@@ -1350,6 +1405,8 @@ def main():
         raw_path = output_path.with_name(output_path.stem + "_raw.pkl")
         print("--- raw (non-EMA) weights ---")
         export(student_params, raw_path, False)
+    if ckpt_path is not None and ckpt_path.exists():
+        ckpt_path.unlink()  # run completed; resume state no longer needed
     print(json.dumps(metrics, indent=2))
 
 
