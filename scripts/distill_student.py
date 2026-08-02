@@ -310,6 +310,19 @@ def main():
                         "file is removed on successful completion.")
     parser.add_argument("--checkpoint-path", default=None,
                         help="Override the checkpoint location.")
+    parser.add_argument("--keep-checkpoint", action="store_true",
+                        help="Do not delete the checkpoint on successful "
+                        "completion. Used to produce a shared prefix that "
+                        "several branch runs resume from.")
+    parser.add_argument("--branch-seed", type=int, default=None,
+                        help="When resuming, re-derive the minibatch PRNG "
+                        "key from this seed instead of restoring the saved "
+                        "one, so several runs resuming from one checkpoint "
+                        "follow different data orders. This is the "
+                        "model-soup branch point: members share a trajectory "
+                        "up to the checkpoint and diverge only afterwards, "
+                        "which keeps them in one loss basin so their weights "
+                        "can be averaged.")
     parser.add_argument("--ema-decay", type=float, default=0.0,
                         help="If > 0 (e.g. 0.999), maintain an exponential "
                         "moving average of the student weights and export "
@@ -1084,9 +1097,14 @@ def main():
         student_params = to_dev(saved["params"])
         ema_params = to_dev(saved["ema"]) if saved["ema"] is not None else None
         opt_state = to_dev(saved["opt_state"])
-        key = jax.random.wrap_key_data(jnp.asarray(saved["key"]))
+        if args.branch_seed is not None:
+            key = jax.random.key(args.branch_seed)
+        else:
+            key = jax.random.wrap_key_data(jnp.asarray(saved["key"]))
         start_step = saved["step"] + 1
-        print(f"Resumed from {ckpt_path} at step {start_step}")
+        print(f"Resumed from {ckpt_path} at step {start_step}"
+              + (f" (branch seed {args.branch_seed})"
+                 if args.branch_seed is not None else ""))
 
     def save_checkpoint(step):
         if ckpt_path is None:
@@ -1405,7 +1423,11 @@ def main():
         raw_path = output_path.with_name(output_path.stem + "_raw.pkl")
         print("--- raw (non-EMA) weights ---")
         export(student_params, raw_path, False)
-    if ckpt_path is not None and ckpt_path.exists():
+    if (
+        ckpt_path is not None
+        and ckpt_path.exists()
+        and not args.keep_checkpoint
+    ):
         ckpt_path.unlink()  # run completed; resume state no longer needed
     print(json.dumps(metrics, indent=2))
 
