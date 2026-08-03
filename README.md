@@ -16,6 +16,9 @@ Various different methods exist for using the models:
 3. Loading traced TorchScript model
 4. Loading the parameters directly into pure Python
 
+A distilled single-network "student" variant of the multimachine model is
+also provided for speed-critical applications (see section 5).
+
 Loading the traced TorchScript model allows the model to be used in Fortran (see below).
 Loading the parameters directly is a minimal-dependency method designed for use with other machine learning frameworks.
 
@@ -72,7 +75,73 @@ Further details on the FTorch Implementation of these networks can be found in a
 - **CMake**: Version >= 3.1 required to build FTorch. Not essential, but helpful for building final Fortran code. 
 
 
-## 4. Compare TGLF and TGLFNN in JETTO production runs
+## 4. Loading the parameters directly into pure Python
+
+```python
+import tglfnn_ukaea
+
+model = tglfnn_ukaea.load("multimachine")  # or "step", "multimachine_student"
+# model["params"]        - raw weights per flux, per ensemble member, per layer
+# model["stats"]         - per-variable mean/std for input/output normalisation
+# model["input_labels"]  - the required input ordering
+# model["config"]        - architecture and training metadata
+```
+
+The reference JAX inference implementation for these dicts is
+[`google-deepmind/fusion_surrogates`](https://github.com/google-deepmind/fusion_surrogates)
+(`fusion_surrogates.tglfnn_ukaea.TGLFNNukaeaModel`), which is also the code
+path used by [TORAX](https://github.com/google-deepmind/torax).
+
+## 5. Distilled student model (fast single-network variant)
+
+`tglfnn_ukaea/weights/multimachine_student.pkl` is a single-network
+distillation of the `multimachine` deep ensemble, produced by
+[scripts/distill_student.py](scripts/distill_student.py):
+
+- **Teacher**: the released `multimachine` checkpoint (per flux: 5-member
+  deep ensemble, 5x512 hidden layers, NLL-trained).
+- **Student**: per flux, a single Gaussian MLP with 4x256 hidden layers and
+  `tanh` activations (~26x fewer FLOPs per evaluation), trained to
+  reproduce the teacher's ensemble mean and total variance
+  (aleatoric + epistemic) on inputs sampled uniformly from the training
+  hypercube recorded in the teacher checkpoint. `tanh` is used instead of
+  `relu` so the surrogate is smooth, which improves the convergence of
+  Newton-type transport solvers.
+- **Schema**: identical pickle schema to the released checkpoints, with
+  `num_estimators: 1` and the reduced architecture recorded in `config`.
+  Since `fusion_surrogates` builds its network from those config entries,
+  the student loads through the existing `TGLFNNukaeaModel` path unchanged:
+
+```python
+from fusion_surrogates.tglfnn_ukaea import tglfnn_ukaea_model
+
+model = tglfnn_ukaea_model.TGLFNNukaeaModel("multimachine_student")
+predictions = model.predict(inputs)  # same API and conventions as the teacher
+```
+
+Distillation quality metrics (student vs teacher on a held-out sample of the
+training hypercube) are stored in `config["distillation"]["metrics"]` inside
+the student checkpoint.
+
+Caveats: the student approximates the *teacher*, adding a small additional
+error on top of the teacher's TGLF approximation error; its variance output
+is the teacher's total (aleatoric + epistemic) uncertainty folded into a
+single channel, and the ensemble-spread decomposition is no longer
+available.
+
+**Selecting a student checkpoint**: pointwise metrics (box RMSE,
+near-threshold RMSE, sign agreement) are necessary but not sufficient.
+Retraining with an identical recipe and near-identical pointwise metrics
+has produced students whose behaviour inside a flux-driven transport
+simulation differed substantially — the self-consistent state sits near
+marginal stability, where small residual biases that pointwise metrics do
+not resolve are amplified by the solver. Checkpoint selection should
+therefore also weigh derivative-sensitive metrics evaluated on the
+training hypercube (e.g. flux-gradient fidelity and critical-gradient
+location error), which target the near-threshold behaviour a stiff
+transport solver is sensitive to.
+
+## 6. Compare TGLF and TGLFNN in JETTO production runs
 
 - TGLFNN is only an approximation of TGLF and it will make mistakes
 - [scripts/tglf_vs_nn_jetto_trajectories.py](scripts/tglf_vs_nn_jetto_trajectories.py) shows how to plot the inputs and outputs spanned by TGLF and TGLFNN in a JETTO production run. **NOTE**: Available only in the following build on the JDC `/home/tn2395/jintrac-devel`

@@ -30,4 +30,8 @@ packages = ["tglfnn_ukaea"]
 
 [tool.setuptools.package-data]
 # Force the packager to include the pickled weights files
-tglfnn_ukaea = ["weights/multimachine.pkl", "weights/step.pkl"]
+tglfnn_ukaea = [
+  "weights/multimachine.pkl",
+  "weights/step.pkl",
+  "weights/multimachine_student.pkl",
+]
