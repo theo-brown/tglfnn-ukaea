@@ -310,6 +310,12 @@ def main():
                         "file is removed on successful completion.")
     parser.add_argument("--checkpoint-path", default=None,
                         help="Override the checkpoint location.")
+    parser.add_argument("--stop-at-step", type=int, default=None,
+                        help="Halt training at this step, save the checkpoint and exit without exporting. --steps still defines the LR "
+                        "schedule, so a prefix stopped early follows "
+                        "exactly the same trajectory the full run would "
+                        "have taken up to that point -- which is what "
+                        "makes it a valid shared branch point.")
     parser.add_argument("--keep-checkpoint", action="store_true",
                         help="Do not delete the checkpoint on successful "
                         "completion. Used to produce a shared prefix that "
@@ -1159,6 +1165,11 @@ def main():
             and step % args.checkpoint_every == 0
         ):
             save_checkpoint(step)
+        if args.stop_at_step is not None and step >= args.stop_at_step:
+            save_checkpoint(step)
+            print(f"Stopped at step {step} (--stop-at-step); checkpoint "
+                  f"written to {ckpt_path}")
+            return
 
     # --- Validation against the teacher ----------------------------------
     # Jacobian validation subset (shared across param sets): teacher
