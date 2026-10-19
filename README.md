@@ -14,8 +14,9 @@ Version names are relative symlinks to descriptive, content-identified directori
 The descriptive directories contain TorchScript/ONNX models, per-flux configs,
 physical reference settings, validation/distribution plots, metrics and checksums.
 Consult each card's uncertainty limitations. Detailed provenance remains in the
-linked tagged surrogate-builder repository. These bundles are separate from the
-existing weights-only Python `load("step")` API.
+linked tagged surrogate-builder repository. 4.1.2 is also distributed in the
+Python package as an ONNX graph, with a JAX model and a TORAX transport model
+(see [section 4](#onnx-graph-networks-jax-and-torax)).
 
 Git LFS is required for runtime files. The committed `.lfsconfig` excludes
 `STEP-effectiveion-EM-SAT1-14D-asinh1-large-ensemble5-9482b564f803/**` from default clone/pull downloads; its metadata remains available.
@@ -111,7 +112,7 @@ The `tglfnn_ukaea` Python package distributes network parameters as plain NumPy 
 | Machine | Versions | Default |
 |---|---|---|
 | `multimachine` | 3.2.1 ([MultiMachineHyper_1Aug25](MultiMachineHyper_1Aug25)) | 3.2.1 |
-| `step` | 1.0.1 ([JETTO-TGLF-EM-17Feb25](JETTO-TGLF-EM-17Feb25)) | 1.0.1 |
+| `step` | 1.0.1 ([JETTO-TGLF-EM-17Feb25](JETTO-TGLF-EM-17Feb25)), 4.1.2 ([STEP EM SAT1](4.1.2/README.md), ONNX graph) | 1.0.1 |
 
 ```python
 import tglfnn_ukaea
@@ -140,6 +141,53 @@ Reference outputs of the ONNX models are distributed as test data, for testing i
 
 ```sh
 python scripts/make_onnx_reference.py
+```
+
+### ONNX graph networks (JAX and TORAX)
+
+Networks whose exports are not a plain MLP ensemble (4.1.x: residual blocks, layer norms, asinh output transform and an embedded uncertainty correction) are distributed as their ONNX graph instead: the node list and every tensor it uses, as plain arrays (`format = "onnx-graph"` in the npz). [tglfnn_ukaea/graph.py](tglfnn_ukaea/graph.py) evaluates the graph node by node with the ONNX operator semantics, with NumPy or with JAX. Nothing about the architecture is assumed, and an unsupported operator is an error.
+
+```python
+import tglfnn_ukaea
+from tglfnn_ukaea.graph import Graph
+
+arrays = tglfnn_ukaea.load("step", "4.1.2")
+mean, variance = Graph.from_arrays(arrays, "efe_gb")(inputs)  # float32 (batch, 14), raw inputs
+```
+
+With JAX (`pip install ".[jax]"`), `TGLFNNukaeaGraphModel` predicts all fluxes, and is jittable, vmappable and differentiable in forward and reverse mode:
+
+```python
+import jax
+from tglfnn_ukaea.model import TGLFNNukaeaGraphModel
+
+jax.config.update("jax_enable_x64", True)  # the exports compare some inputs in float64
+model = TGLFNNukaeaGraphModel("step", "4.1.2")  # or path="<graph npz>"
+predictions = model.predict(inputs)  # {"efe_gb": (..., 2) [mean, variance], ...}
+```
+
+The TORAX transport model (`pip install ".[torax]"`, TORAX 1.4.x) is registered as `tglfnn-ukaea-graph`:
+
+```python
+import tglfnn_ukaea.torax_transport_model as tglfnn_graph
+
+tglfnn_graph.register()
+config["transport"] = {"model_name": "tglfnn-ukaea-graph", "version": "4.1.2", ...}
+```
+
+The TORAX model converts between TORAX's gyro-Bohm normalisation (deuterium mass) and the network's, which the export records from the bundle's `tglf_settings.json` (`MASS_1`; 4.1.x uses the proton mass): XNUE and VEXB_SHEAR are multiplied by sqrt(m_ref/m_D) before the network, and the gyro-Bohm fluxes by the same factor after it. The 4.1.x networks are effective-ion models trained at fixed `RMAJ_LOC = 2.0` (aspect ratio 2), with `MASS_2 = 2.5`; neither is a network input, so other aspect ratios or ion masses are outside the training data.
+
+The graphs are exported by [scripts/onnx_to_graph_npz.py](scripts/onnx_to_graph_npz.py), which checks the result against onnxruntime. Larger networks (e.g. 4.1.1, 270 MB) can be exported locally and used with `path=`:
+
+```sh
+python scripts/onnx_to_graph_npz.py 4.1.2 -o tglfnn_ukaea/weights/step/4.1.2.npz
+python scripts/onnx_to_graph_npz.py 4.1.1 -o step-4.1.1.npz
+```
+
+For graph networks, the references also hold the derivatives of each output with respect to the inputs, from finite differences of the graph converted to float64 and run with onnxruntime. The tests in [tests/](tests/) compare the NumPy and JAX evaluations and the JAX derivatives against them:
+
+```sh
+python -m unittest discover tests
 ```
 
 ## 5. Compare TGLF and TGLFNN in JETTO production runs
