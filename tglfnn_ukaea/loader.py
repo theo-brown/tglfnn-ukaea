@@ -33,7 +33,9 @@ def load(
     None, DEFAULT_VERSIONS[machine] is loaded.
 
     The arrays are exported from the ONNX models by scripts/onnx_to_npz.py; see
-    that script for the layout and the forward pass they define.
+    that script for the layout and the forward pass they define. Networks with
+    `format == "onnx-graph"` are instead stored as their ONNX graph by
+    scripts/onnx_to_graph_npz.py, and are evaluated with tglfnn_ukaea.graph.
     """
     return _load_npz(WEIGHTS_DIR, machine, version)
 

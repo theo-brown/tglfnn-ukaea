@@ -20,8 +20,13 @@ dependencies = ["numpy>2"]
 
 [project.optional-dependencies]
 dev = ["pandas","matplotlib"]
-# For regenerating the weights from the ONNX models (scripts/onnx_to_npz.py)
-export = ["onnx", "onnxruntime"]
+# For regenerating the weights from the ONNX models (scripts/onnx_to_npz.py,
+# scripts/onnx_to_graph_npz.py, scripts/make_onnx_reference.py)
+export = ["onnx", "onnxruntime", "pyyaml"]
+# JAX model of the networks stored as ONNX graphs (tglfnn_ukaea.model)
+jax = ["jax"]
+# TORAX transport model (tglfnn_ukaea.torax_transport_model)
+torax = ["jax", "torax>=1.4,<1.5"]
 
 [project.urls]
 Homepage = "https://github.com/ukaea/tglfnn-ukaea/"
